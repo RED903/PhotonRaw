@@ -6,10 +6,16 @@ import '../services/scopes.dart';
 /// - 4개 분석 모드 탭: Waveform, Parade, Histogram, 8-Band
 class ScopeAnalyzerWidget extends StatefulWidget {
   final ScopeData? scopeData;
+  final bool collapsible;
+  final bool collapsed;
+  final VoidCallback? onToggleCollapse;
 
   const ScopeAnalyzerWidget({
     super.key,
     required this.scopeData,
+    this.collapsible = false,
+    this.collapsed = false,
+    this.onToggleCollapse,
   });
 
   @override
@@ -32,11 +38,40 @@ class _ScopeAnalyzerWidgetState extends State<ScopeAnalyzerWidget> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // 4개 스코프 모드 전환 버튼
+          // 4개 스코프 모드 전환 버튼 + (세로 긴 모바일 화면에서) 열고 닫기 토글 버튼
           SizedBox(
             height: 24,
             child: Row(
               children: [
+                if (widget.collapsible)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: InkWell(
+                      onTap: widget.onToggleCollapse,
+                      borderRadius: BorderRadius.circular(3),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2A2A2A),
+                          borderRadius: BorderRadius.circular(3),
+                          border: Border.all(color: const Color(0xFF444444)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              widget.collapsed ? '▶ 파형 열기' : '▼ 파형 닫기',
+                              style: const TextStyle(
+                                fontSize: 10.0,
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFFE8A838),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
                 for (final m in [
                   ('waveform', 'Waveform'),
                   ('parade', 'Parade'),
@@ -47,16 +82,21 @@ class _ScopeAnalyzerWidgetState extends State<ScopeAnalyzerWidget> {
                     child: Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 2),
                       child: InkWell(
-                        onTap: () => setState(() => _mode = m.$1),
+                        onTap: () {
+                          setState(() => _mode = m.$1);
+                          if (widget.collapsible && widget.collapsed) {
+                            widget.onToggleCollapse?.call();
+                          }
+                        },
                         borderRadius: BorderRadius.circular(3),
                         child: Container(
                           decoration: BoxDecoration(
-                            color: _mode == m.$1
+                            color: _mode == m.$1 && !widget.collapsed
                                 ? const Color(0xFF3E3524)
                                 : const Color(0xFF181818),
                             borderRadius: BorderRadius.circular(3),
                             border: Border.all(
-                              color: _mode == m.$1
+                              color: _mode == m.$1 && !widget.collapsed
                                   ? const Color(0xFFE8A838)
                                   : const Color(0xFF333333),
                             ),
@@ -66,10 +106,10 @@ class _ScopeAnalyzerWidgetState extends State<ScopeAnalyzerWidget> {
                               m.$2,
                               style: TextStyle(
                                 fontSize: 10.5,
-                                fontWeight: _mode == m.$1
+                                fontWeight: _mode == m.$1 && !widget.collapsed
                                     ? FontWeight.bold
                                     : FontWeight.normal,
-                                color: _mode == m.$1
+                                color: _mode == m.$1 && !widget.collapsed
                                     ? const Color(0xFFE8A838)
                                     : const Color(0xFF999999),
                               ),
@@ -83,20 +123,22 @@ class _ScopeAnalyzerWidgetState extends State<ScopeAnalyzerWidget> {
               ],
             ),
           ),
-          const SizedBox(height: 6),
-          // 스코프 표시 캔버스
-          Container(
-            height: 118,
-            decoration: BoxDecoration(
-              color: const Color(0xFF121212),
-              borderRadius: BorderRadius.circular(4),
-              border: Border.all(color: const Color(0xFF2D2D2D)),
+          if (!widget.collapsed) ...[
+            const SizedBox(height: 6),
+            // 스코프 표시 캔버스
+            Container(
+              height: 118,
+              decoration: BoxDecoration(
+                color: const Color(0xFF121212),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: const Color(0xFF2D2D2D)),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(3),
+                child: _buildScopeBody(),
+              ),
             ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(3),
-              child: _buildScopeBody(),
-            ),
-          ),
+          ],
         ],
       ),
     );

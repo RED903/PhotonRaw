@@ -287,7 +287,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   Timer? _qualityDebounceTimer;
 
   bool _isLoadingFile = false;
-  String _statusMessage = '준비 완료 (v1.0.6) — 사진 또는 RAW 파일을 열어주세요';
+  String _statusMessage = '준비 완료 (v1.0.7) — 사진 또는 RAW 파일을 열어주세요';
 
   // 우측 모듈 필터 및 검색 상태 (SemiDarktable 6개 카테고리 탭과 동일)
   String _activeCategory = 'all'; // 'all', 'active', 'tone', 'color', 'geometry', 'detail'
@@ -299,6 +299,9 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   final Set<String> _expandedModules = {};
   // 8밴드 컬러 이퀄라이저 기본 시작 모드 ('hue': 색조, 'sat': 채도, 'bri': 밝기)
   String _ceqMode = 'hue';
+
+  // 세로 비율(1:1.7 이상) 모바일 화면에서 파형/히스토그램 열림/닫힘 상태 (모바일에서 공간 확보를 위해 기본 닫힘)
+  bool _scopeCollapsedInTallMode = true;
 
   // 뷰포트 인터랙션 모드 상태
   bool _showGrid = false;
@@ -1120,7 +1123,6 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       }
       if (mounted) {
         setState(() => _statusMessage = '내보내기 완료!');
-        _showSnack('성공적으로 내보냈습니다.');
       }
     } catch (e) {
       if (mounted) {
@@ -1199,8 +1201,10 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             body: SafeArea(
               child: LayoutBuilder(
                 builder: (context, rootConstraints) {
-                  // 창 크기 변경 시 위젯 트리 구조(Row/Column)가 교체되지 않도록 고정 구조 유지
-                  final maxW = math.max(320.0, rootConstraints.maxWidth);
+                  final maxW = math.max(240.0, rootConstraints.maxWidth);
+                  final maxH = math.max(320.0, rootConstraints.maxHeight);
+                  // 세로 비율이 1:1.7 이상(극단적으로 세로로 긴 모바일 화면)인지 판별
+                  final isTallPortrait = (maxH / maxW) >= 1.7;
                   final inspectorWidth =
                       (maxW * 0.34).clamp(240.0, 380.0).clamp(160.0, maxW * 0.52);
 
@@ -1209,18 +1213,31 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         _buildTopActionToolbar(),
-                        Expanded(
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Expanded(child: _buildCenterViewport()),
-                              SizedBox(
-                                width: inspectorWidth,
-                                child: _buildRightInspector(),
-                              ),
-                            ],
+                        if (isTallPortrait) ...[
+                          // 세로 1:1.7 이상 모바일 레이아웃: [제일 위: 이미지] -> [그 아래: 조절 창] -> [그 아래: 필름 스트립]
+                          Expanded(
+                            flex: 48,
+                            child: _buildCenterViewport(),
                           ),
-                        ),
+                          Expanded(
+                            flex: 52,
+                            child: _buildRightInspector(isTallPortrait: true),
+                          ),
+                        ] else
+                          Expanded(
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                Expanded(child: _buildCenterViewport()),
+                                SizedBox(
+                                  width: inspectorWidth,
+                                  child: _buildRightInspector(
+                                    isTallPortrait: false,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         FilmstripWidget(
                           items: _photos
                               .map(
@@ -1299,7 +1316,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.6',
+                '⚡ PhotonRaw v1.0.7',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -1556,23 +1573,40 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     );
   }
 
-  /// 우측 다크룸 인스펙터 패널 (창 크기 변경 시에도 위젯 트리 구조가 바뀌지 않도록 고정 Column + Visibility 유지)
-  Widget _buildRightInspector() {
+  /// 우측(또는 세로 1:1.7 이상 모바일에서 하단) 다크룸 인스펙터 패널
+  Widget _buildRightInspector({bool isTallPortrait = false}) {
     return Container(
-      decoration: const BoxDecoration(
-        color: Color(0xFF202020),
-        border: Border(left: BorderSide(color: Color(0xFF333333))),
+      decoration: BoxDecoration(
+        color: const Color(0xFF202020),
+        border: Border(
+          left: isTallPortrait
+              ? BorderSide.none
+              : const BorderSide(color: Color(0xFF333333)),
+          top: isTallPortrait
+              ? const BorderSide(color: Color(0xFF333333))
+              : BorderSide.none,
+        ),
       ),
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final showScope = constraints.maxHeight >= 310;
+          final showScope = isTallPortrait
+              ? constraints.maxHeight >= 140
+              : constraints.maxHeight >= 310;
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               if (showScope)
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
-                  child: ScopeAnalyzerWidget(scopeData: _scopeData),
+                  padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
+                  child: ScopeAnalyzerWidget(
+                    scopeData: _scopeData,
+                    collapsible: isTallPortrait,
+                    collapsed: isTallPortrait && _scopeCollapsedInTallMode,
+                    onToggleCollapse: () => setState(
+                      () => _scopeCollapsedInTallMode =
+                          !_scopeCollapsedInTallMode,
+                    ),
+                  ),
                 ),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -1714,33 +1748,38 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     final p = _params;
     final cards = <Widget>[];
 
-    // 1. 기하학 & 크롭 (Geometry & Crop) — rotate90: 0, 90, 180, 270
-    final geoActive = p.rotate90 != 0 ||
+    // 1-A. 회전 & 기울기 (Rotation & Tilt) — rotate90: 0, 90, 180, 270 / flipH / flipV / angle
+    final tiltActive = p.rotate90 != 0 ||
         p.flipH ||
         p.flipV ||
-        p.angle.abs() > 1e-4 ||
-        p.cropEnabled;
+        p.angle.abs() > 1e-4;
     if (_isModuleVisible(
-      title: '기하학 & 자르기 (Geometry & Crop)',
+      title: '회전 & 기울기 (Rotation & Tilt)',
       category: 'geometry',
-      enabled: geoActive,
+      enabled: tiltActive,
     )) {
       cards.add(
         _buildCard(
-          title: '📐 기하학 & 자르기 (Geometry & Crop)',
+          title: '📐 회전 & 기울기 (Rotation & Tilt)',
           category: 'geometry',
-          enabled: geoActive,
+          enabled: tiltActive,
           initiallyExpanded: false,
           onToggleEnabled: (val) {
-            _updateParams(
-              (params) => params.cropEnabled = val,
-              recordUndo: true,
-              fast: false,
-            );
+            if (!val) {
+              _updateParams(
+                (params) {
+                  params.rotate90 = 0;
+                  params.flipH = false;
+                  params.flipV = false;
+                  params.angle = 0.0;
+                },
+                recordUndo: true,
+                fast: false,
+              );
+            }
           },
           onReset: () {
             setState(() {
-              _cropEditMode = false;
               _horizonMode = false;
             });
             _updateParams(
@@ -1749,8 +1788,6 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 params.flipH = false;
                 params.flipV = false;
                 params.angle = 0.0;
-                params.cropEnabled = false;
-                params.cropRect = [0.0, 0.0, 1.0, 1.0];
               },
               recordUndo: true,
               fast: false,
@@ -1842,7 +1879,46 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 ),
               ],
             ),
-            const Divider(height: 14, color: Color(0xFF383838)),
+          ],
+        ),
+      );
+    }
+
+    // 1-B. 크롭 / 자르기 (Crop)
+    if (_isModuleVisible(
+      title: '크롭 / 자르기 (Crop)',
+      category: 'geometry',
+      enabled: p.cropEnabled,
+    )) {
+      cards.add(
+        _buildCard(
+          title: '✂️ 크롭 / 자르기 (Crop)',
+          category: 'geometry',
+          enabled: p.cropEnabled,
+          initiallyExpanded: false,
+          onToggleEnabled: (val) {
+            _updateParams(
+              (params) => params.cropEnabled = val,
+              recordUndo: true,
+              fast: false,
+            );
+          },
+          onReset: () {
+            setState(() {
+              _cropEditMode = false;
+              _cropAspectName = 'Free';
+              _cropAspectRatio = null;
+            });
+            _updateParams(
+              (params) {
+                params.cropEnabled = false;
+                params.cropRect = [0.0, 0.0, 1.0, 1.0];
+              },
+              recordUndo: true,
+              fast: false,
+            );
+          },
+          children: [
             Row(
               children: [
                 Expanded(

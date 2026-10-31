@@ -57,7 +57,9 @@ class ViewportCanvas extends StatefulWidget {
 
 class ViewportCanvasState extends State<ViewportCanvas> {
   double _zoom = 1.0;
+  double _scaleStartZoom = 1.0;
   Offset _pan = Offset.zero;
+  bool _isPinching = false;
 
   bool _draggingSplit = false;
   String? _cropDragHandle; // 'tl','tr','bl','br','move'
@@ -199,11 +201,25 @@ class ViewportCanvasState extends State<ViewportCanvas> {
     }
   }
 
-  void _onPanStart(DragStartDetails details, Size size) {
+  void _onScaleStart(ScaleStartDetails details, Size size) {
     final img = widget.processedImage;
     if (img == null) return;
+    _scaleStartZoom = _zoom;
+
+    // 두 손가락 이상(핀치 줌) 시작 시 편집 드래그 모드를 해제하고 확대/축소에 집중
+    if (details.pointerCount >= 2) {
+      _isPinching = true;
+      _draggingSplit = false;
+      _cropDragHandle = null;
+      _draggingSpotIndex = null;
+      _horizonStart = null;
+      _horizonEnd = null;
+      return;
+    }
+    _isPinching = false;
+
     final imgRect = _computeImageRect(size);
-    final pos = details.localPosition;
+    final pos = details.localFocalPoint;
 
     // 1. 수평선 2점 그리기 모드
     if (widget.horizonMode) {
@@ -249,11 +265,25 @@ class ViewportCanvasState extends State<ViewportCanvas> {
     }
   }
 
-  void _onPanUpdate(DragUpdateDetails details, Size size) {
+  void _onScaleUpdate(ScaleUpdateDetails details, Size size) {
     final img = widget.processedImage;
     if (img == null) return;
+
+    // 두 손가락 핀치 확대/축소 및 팬 이동 처리 (모바일 멀티터치 완벽 지원)
+    if (details.pointerCount >= 2 || _isPinching || (details.scale - 1.0).abs() > 1e-3) {
+      _isPinching = true;
+      setState(() {
+        _zoom = (_scaleStartZoom * details.scale).clamp(0.25, 16.0);
+        _pan += details.focalPointDelta;
+        if ((_zoom - 1.0).abs() < 0.03) {
+          _zoom = 1.0;
+        }
+      });
+      return;
+    }
+
     final imgRect = _computeImageRect(size);
-    final pos = details.localPosition;
+    final pos = details.localFocalPoint;
 
     // 1. 수평선 그리기 업데이트
     if (widget.horizonMode && _horizonStart != null) {
@@ -347,12 +377,15 @@ class ViewportCanvasState extends State<ViewportCanvas> {
 
     // 5. 기본 팬(Pan) 이동
     setState(() {
-      _pan += details.delta;
+      _pan += details.focalPointDelta;
     });
   }
 
-  void _onPanEnd(DragEndDetails details) {
-    if (widget.horizonMode && _horizonStart != null && _horizonEnd != null) {
+  void _onScaleEnd(ScaleEndDetails details) {
+    if (!_isPinching &&
+        widget.horizonMode &&
+        _horizonStart != null &&
+        _horizonEnd != null) {
       final dx = _horizonEnd!.dx - _horizonStart!.dx;
       final dy = _horizonEnd!.dy - _horizonStart!.dy;
       if (math.sqrt(dx * dx + dy * dy) > 12.0) {
@@ -366,6 +399,7 @@ class ViewportCanvasState extends State<ViewportCanvas> {
         _horizonEnd = null;
       });
     }
+    _isPinching = false;
     _draggingSplit = false;
     _cropDragHandle = null;
     _cropDragStartNorm = null;
@@ -466,9 +500,9 @@ class ViewportCanvasState extends State<ViewportCanvas> {
               onDoubleTap: resetZoom,
               onTapUp: (d) => _onTapUp(d, size),
               onSecondaryTapUp: (d) => _onSecondaryTapUp(d, size),
-              onPanStart: (d) => _onPanStart(d, size),
-              onPanUpdate: (d) => _onPanUpdate(d, size),
-              onPanEnd: _onPanEnd,
+              onScaleStart: (d) => _onScaleStart(d, size),
+              onScaleUpdate: (d) => _onScaleUpdate(d, size),
+              onScaleEnd: _onScaleEnd,
               child: Container(
                 color: const Color(0xFF141414),
                 child: ClipRect(
