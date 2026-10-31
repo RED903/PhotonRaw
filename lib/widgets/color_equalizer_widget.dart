@@ -219,9 +219,12 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget> {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text(
-              '노드 상하 드래그: 조절 (-100~+100) | 더블클릭: 0 초기화',
-              style: TextStyle(fontSize: 9.5, color: Color(0xFF777777)),
+            const Flexible(
+              child: Text(
+                '노드 상하 드래그: 조절 | 더블클릭: 0 초기화',
+                style: TextStyle(fontSize: 9.5, color: Color(0xFF777777)),
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
             InkWell(
               onTap: () {

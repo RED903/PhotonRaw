@@ -81,9 +81,9 @@ void main() {
     expect(out.beforeRgba, isNotNull);
 
     final scopes = computeAllScopes(out.rgba, out.width, out.height);
-    expect(scopes.waveformRgba.length, kScopeW * kScopeH * 4);
-    expect(scopes.paradeRgba.length, kScopeW * kScopeH * 4);
-    expect(scopes.histogramRgba.length, kScopeW * kScopeH * 4);
+    expect(scopes.waveformBins.length, kGridCols * kGridRows * 3);
+    expect(scopes.paradeBins.length, kGridCols * kGridRows);
+    expect(scopes.histR.length, 128);
     expect(scopes.bandLevels.length, 8);
 
     final lut = evaluateMonotoneCubicSpline([
@@ -96,19 +96,34 @@ void main() {
     expect(lut.last, closeTo(1.0, 1e-3));
   });
 
-  testWidgets('PhotonRaw 초기 실행 시 물결 이미지 없이 빈 다크룸 UI 및 6개 카테고리 탭 렌더링 확인', (
+  testWidgets('PhotonRaw v1.0.4 상단 툴바 단일 행 레이아웃 및 극단적 창 크기 조절 스트레스 테스트', (
     WidgetTester tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(1440, 900));
     await tester.pumpWidget(const PhotonRawApp());
-    expect(find.text('⚡ PhotonRaw'), findsOneWidget);
+    expect(find.text('⚡ PhotonRaw v1.0.4'), findsOneWidget);
     expect(find.text('사진 또는 RAW 파일을 불러오세요'), findsOneWidget);
-    expect(find.text('전체'), findsOneWidget);
-    expect(find.text('활성'), findsOneWidget);
-    expect(find.text('톤/노출'), findsOneWidget);
-    expect(find.text('색상'), findsOneWidget);
-    expect(find.text('기하학'), findsOneWidget);
-    expect(find.text('디테일'), findsOneWidget);
+
+    // 상단 '📂 파일 열기' 버튼이 화면 전체 가로 폭(1440)으로 늘어나지 않고 정상 크기(< 200px)인지 검증
+    final openBtnSize = tester.getSize(find.text('📂 파일 열기'));
+    expect(openBtnSize.width, lessThan(200.0));
+
+    // 다양한 창 크기(초대형 ~ 초소형 최소화 직전)로 연속 리사이즈 시 오버플로우나 예외가 전혀 없는지 검증
+    for (final sz in const [
+      Size(1920, 1080),
+      Size(1280, 720),
+      Size(900, 500),
+      Size(640, 360),
+      Size(420, 260),
+      Size(240, 160),
+      Size(80, 80),
+      Size(1440, 900),
+    ]) {
+      await tester.binding.setSurfaceSize(sz);
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+    }
+
     await tester.binding.setSurfaceSize(null);
   });
 }

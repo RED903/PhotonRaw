@@ -237,15 +237,19 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget> {
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8),
                   height: 24,
-                  alignment: Alignment.center,
                   decoration: BoxDecoration(
                     color: const Color(0xFF222222),
                     borderRadius: BorderRadius.circular(4),
                     border: Border.all(color: const Color(0xFF3A3A3A)),
                   ),
-                  child: const Text(
-                    '초기화',
-                    style: TextStyle(fontSize: 10.5, color: Color(0xFFBBBBBB)),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        '초기화',
+                        style: TextStyle(fontSize: 10.5, color: Color(0xFFBBBBBB)),
+                      ),
+                    ],
                   ),
                 ),
               ),

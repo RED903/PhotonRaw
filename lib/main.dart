@@ -25,8 +25,19 @@ import 'widgets/tone_curve_widget.dart';
 import 'widgets/viewport_canvas.dart';
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const PhotonRawApp());
+  // 프레임워크 및 비동기 예외로 인해 앱이 강제 종료되지 않도록 글로벌 가드 설정
+  runZonedGuarded(
+    () {
+      WidgetsFlutterBinding.ensureInitialized();
+      FlutterError.onError = (FlutterErrorDetails details) {
+        FlutterError.presentError(details);
+      };
+      runApp(const PhotonRawApp());
+    },
+    (Object error, StackTrace stack) {
+      debugPrint('Uncaught zone error: $error\n$stack');
+    },
+  );
 }
 
 class PhotonRawApp extends StatelessWidget {
@@ -35,7 +46,7 @@ class PhotonRawApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PhotonRaw — Pro RAW & Photo Darkroom',
+      title: 'PhotonRaw v1.0.4 — Pro RAW & Photo Darkroom',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF181818),
@@ -50,12 +61,13 @@ class PhotonRawApp extends StatelessWidget {
   }
 }
 
-/// 개별 로드된 사진의 상태(원본 버퍼, 프록시 버퍼, 파라미터, Undo/Redo 스택, 썸네일) 보관
+/// 개별 로드된 사진의 상태(원본 버퍼, 고속/고화질 프록시 버퍼, 파라미터, Undo/Redo 스택, 썸네일) 보관
 class LoadedPhotoState {
   final String filePath;
   final String fileName;
   final DecodedImage fullDecoded;
-  final ProxyImage proxy;
+  final ProxyImage fastProxy; // 슬라이더 드래그 중 즉각 반응용 (560px)
+  final ProxyImage qualityProxy; // 조작 완료 후 고해상도 프리뷰용 (1150px)
   PipelineParams params;
   final List<Map<String, dynamic>> undoStack = [];
   final List<Map<String, dynamic>> redoStack = [];
@@ -65,7 +77,8 @@ class LoadedPhotoState {
     required this.filePath,
     required this.fileName,
     required this.fullDecoded,
-    required this.proxy,
+    required this.fastProxy,
+    required this.qualityProxy,
     required this.params,
     this.thumbnailImage,
   });
@@ -75,35 +88,16 @@ class LoadedPhotoState {
 class _DecodedFileBundle {
   final String filePath;
   final DecodedImage decoded;
-  final ProxyImage proxy;
+  final ProxyImage fastProxy;
+  final ProxyImage qualityProxy;
   final ProxyImage thumbProxy;
 
   _DecodedFileBundle({
     required this.filePath,
     required this.decoded,
-    required this.proxy,
+    required this.fastProxy,
+    required this.qualityProxy,
     required this.thumbProxy,
-  });
-}
-
-/// 백그라운드 Isolate에서 프리뷰 파이프라인 + 스코프 계산을 수행하기 위한 요청/응답 패킷
-class _PreviewRenderJob {
-  final Uint8List proxyRgb;
-  final int proxyW;
-  final int proxyH;
-  final Map<String, dynamic> paramsMap;
-  final bool cropEditMode;
-  final bool softProofJpeg;
-  final bool needBefore;
-
-  _PreviewRenderJob({
-    required this.proxyRgb,
-    required this.proxyW,
-    required this.proxyH,
-    required this.paramsMap,
-    required this.cropEditMode,
-    required this.softProofJpeg,
-    required this.needBefore,
   });
 }
 
@@ -127,26 +121,27 @@ class _PreviewRenderOutput {
   });
 }
 
-/// 백그라운드 Isolate 실행 함수: 프리뷰 렌더링 + 스코프 계산
-_PreviewRenderOutput _executePreviewRenderIsolate(_PreviewRenderJob job) {
-  final params = PipelineParams.fromMap(job.paramsMap);
-
-  // 크롭 편집 모드일 때는 전체 영역을 보면서 크롭 박스를 조절할 수 있도록 임시로 cropEnabled 해제
+/// 프리뷰 파이프라인 + 스코프 계산 실행 함수
+_PreviewRenderOutput _computePreviewSync({
+  required ProxyImage srcProxy,
+  required PipelineParams params,
+  required bool cropEditMode,
+  required bool softProofJpeg,
+  required bool needBefore,
+}) {
   final effectiveParams = params.clone();
-  if (job.cropEditMode) {
+  if (cropEditMode) {
     effectiveParams.cropEnabled = false;
   }
 
-  final srcProxy = ProxyImage(job.proxyW, job.proxyH, job.proxyRgb);
   final rendered = renderPreview(
     srcProxy,
     effectiveParams,
-    wantBefore: job.needBefore,
+    wantBefore: needBefore,
   );
 
   Uint8List afterRgba = rendered.rgba;
-  // 8-bit JPEG 소프트 프루핑 시뮬레이션 (양자화 아티팩트 미리보기)
-  if (job.softProofJpeg) {
+  if (softProofJpeg) {
     final tempImg = img.Image.fromBytes(
       width: rendered.width,
       height: rendered.height,
@@ -190,7 +185,6 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   final GlobalKey<ViewportCanvasState> _viewportKey =
       GlobalKey<ViewportCanvasState>();
 
-  // 시작 시 이상한 물결 이미지를 로드하지 않고 빈 리스트로 시작
   final List<LoadedPhotoState> _photos = [];
   int _currentIndex = -1;
 
@@ -199,11 +193,14 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   ui.Image? _beforeUiImage;
   ScopeData? _scopeData;
 
-  // 백그라운드 렌더링 코얼레싱 제어 (슬라이더 고속 드래그 시 멈춤 방지)
+  // 렌더링 코얼레싱 및 디바운스 타이머 (OS 스레드 남발 및 창 크기 변경 크래시 원천 차단)
   bool _isRendering = false;
   bool _hasPendingRender = false;
+  bool _pendingFastMode = false;
+  Timer? _qualityDebounceTimer;
+
   bool _isLoadingFile = false;
-  String _statusMessage = '준비 완료 — 사진 또는 RAW 파일을 열어주세요';
+  String _statusMessage = '준비 완료 (v1.0.4) — 사진 또는 RAW 파일을 열어주세요';
 
   // 우측 모듈 필터 및 검색 상태 (SemiDarktable 6개 카테고리 탭과 동일)
   String _activeCategory = 'all'; // 'all', 'active', 'tone', 'color', 'geometry', 'detail'
@@ -242,13 +239,24 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
 
   @override
   void dispose() {
+    _qualityDebounceTimer?.cancel();
     _searchController.dispose();
-    _processedUiImage?.dispose();
-    _beforeUiImage?.dispose();
+    _safeDisposeImage(_processedUiImage);
+    _safeDisposeImage(_beforeUiImage);
     for (final p in _photos) {
-      p.thumbnailImage?.dispose();
+      _safeDisposeImage(p.thumbnailImage);
     }
     super.dispose();
+  }
+
+  /// Windows GPU 래스터 스레드가 그리기를 마친 뒤 안전하게 텍스처를 해제 (즉시 dispose 시 발생하는 C++ Access Violation 방지)
+  void _safeDisposeImage(ui.Image? imgHandle) {
+    if (imgHandle == null) return;
+    Future.delayed(const Duration(milliseconds: 2500), () {
+      try {
+        imgHandle.dispose();
+      } catch (_) {}
+    });
   }
 
   Future<void> _loadUserPresets() async {
@@ -330,22 +338,29 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       try {
         final bundle = await Isolate.run<_DecodedFileBundle>(() {
           final decoded = decodeImageFile(path);
-          final proxy = makeProxy(
+          final qualityProxy = makeProxy(
             decoded.rgb,
             decoded.width,
             decoded.height,
-            1280,
+            1150,
+          );
+          final fastProxy = makeProxy(
+            qualityProxy.rgb,
+            qualityProxy.width,
+            qualityProxy.height,
+            560,
           );
           final thumbProxy = makeProxy(
-            decoded.rgb,
-            decoded.width,
-            decoded.height,
+            fastProxy.rgb,
+            fastProxy.width,
+            fastProxy.height,
             180,
           );
           return _DecodedFileBundle(
             filePath: path,
             decoded: decoded,
-            proxy: proxy,
+            fastProxy: fastProxy,
+            qualityProxy: qualityProxy,
             thumbProxy: thumbProxy,
           );
         });
@@ -368,7 +383,8 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           filePath: path,
           fileName: fileName,
           fullDecoded: bundle.decoded,
-          proxy: bundle.proxy,
+          fastProxy: bundle.fastProxy,
+          qualityProxy: bundle.qualityProxy,
           params: initParams,
           thumbnailImage: thumbImg,
         );
@@ -395,49 +411,60 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
 
     if (_currentPhoto != null) {
       _viewportKey.currentState?.resetZoom();
-      _triggerRender();
+      _triggerRender(fast: false);
     }
   }
 
-  /// 백그라운드 Isolate에서 비동기 파이프라인 렌더링 실행 (프레임 병합으로 끊김/크래시 방지)
-  Future<void> _triggerRender() async {
+  /// 파이프라인 렌더링 실행
+  /// - 슬라이더 조작 중(fast: true)에는 560px 고속 프록시로 즉시 렌더링하고, 조작이 멈추면 180ms 뒤 1150px 고화질 프록시로 마감
+  /// - 매 프레임 Isolate.run을 남발하지 않아 Windows에서 스레드 고갈이나 크래시가 절대 발생하지 않음
+  Future<void> _triggerRender({bool fast = true}) async {
     final photo = _currentPhoto;
     if (photo == null) {
+      final oldAfter = _processedUiImage;
+      final oldBefore = _beforeUiImage;
       setState(() {
-        _processedUiImage?.dispose();
-        _beforeUiImage?.dispose();
         _processedUiImage = null;
         _beforeUiImage = null;
         _scopeData = null;
       });
+      _safeDisposeImage(oldAfter);
+      _safeDisposeImage(oldBefore);
       return;
+    }
+
+    if (fast) {
+      _qualityDebounceTimer?.cancel();
+      _qualityDebounceTimer = Timer(const Duration(milliseconds: 200), () {
+        if (mounted && _currentPhoto != null) {
+          _triggerRender(fast: false);
+        }
+      });
     }
 
     if (_isRendering) {
       _hasPendingRender = true;
+      _pendingFastMode = fast;
       return;
     }
     _isRendering = true;
 
     try {
+      bool useFast = fast;
       do {
         _hasPendingRender = false;
         final cur = _currentPhoto;
         if (cur == null) break;
 
-        final job = _PreviewRenderJob(
-          proxyRgb: cur.proxy.rgb,
-          proxyW: cur.proxy.width,
-          proxyH: cur.proxy.height,
-          paramsMap: cur.params.toMap(),
+        final targetProxy = useFast ? cur.fastProxy : cur.qualityProxy;
+        final output = _computePreviewSync(
+          srcProxy: targetProxy,
+          params: cur.params,
           cropEditMode: _cropEditMode,
           softProofJpeg: _softProofJpeg,
           needBefore: cur.params.splitViewEnabled,
         );
 
-        final output = await Isolate.run(
-          () => _executePreviewRenderIsolate(job),
-        );
         final newAfterImg = await _bytesToUiImage(
           output.afterRgba,
           output.afterW,
@@ -456,18 +483,22 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         }
 
         if (!mounted) {
-          newAfterImg.dispose();
-          newBeforeImg?.dispose();
+          _safeDisposeImage(newAfterImg);
+          _safeDisposeImage(newBeforeImg);
           break;
         }
 
+        final prevAfter = _processedUiImage;
+        final prevBefore = _beforeUiImage;
         setState(() {
-          _processedUiImage?.dispose();
-          _beforeUiImage?.dispose();
           _processedUiImage = newAfterImg;
           _beforeUiImage = newBeforeImg;
           _scopeData = output.scopes;
         });
+        _safeDisposeImage(prevAfter);
+        _safeDisposeImage(prevBefore);
+
+        useFast = _pendingFastMode;
       } while (_hasPendingRender && mounted);
     } catch (e) {
       if (mounted) {
@@ -498,7 +529,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       photo.params = PipelineParams.fromMap(prev);
       _statusMessage = '실행 취소 완료 (${photo.undoStack.length}단계 남음)';
     });
-    _triggerRender();
+    _triggerRender(fast: false);
   }
 
   void _redo() {
@@ -510,13 +541,14 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       photo.params = PipelineParams.fromMap(next);
       _statusMessage = '다시 실행 완료';
     });
-    _triggerRender();
+    _triggerRender(fast: false);
   }
 
   /// 파라미터 업데이트 헬퍼
   void _updateParams(
     void Function(PipelineParams p) mutator, {
     bool recordUndo = false,
+    bool fast = true,
   }) {
     final photo = _currentPhoto;
     if (photo == null) return;
@@ -526,7 +558,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     setState(() {
       mutator(photo.params);
     });
-    _triggerRender();
+    _triggerRender(fast: fast);
   }
 
   /// 자동 노출 보정 (SemiDarktable auto_exposure 이식)
@@ -535,7 +567,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     if (photo == null) return;
     _pushUndoSnapshot();
 
-    final rgb = photo.proxy.rgb;
+    final rgb = photo.fastProxy.rgb;
     double sumLum = 0.0;
     final count = rgb.length ~/ 3;
     for (int i = 0; i < rgb.length; i += 3) {
@@ -555,7 +587,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       _statusMessage =
           '자동 노출 적용됨: ${photo.params.expEv.toStringAsFixed(2)} EV';
     });
-    _triggerRender();
+    _triggerRender(fast: false);
   }
 
   /// Gray World 자동 화이트밸런스 (SemiDarktable auto_wb 이식)
@@ -564,7 +596,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     if (photo == null) return;
     _pushUndoSnapshot();
 
-    final lin = srgb8ToLinear(photo.proxy);
+    final lin = srgb8ToLinear(photo.fastProxy);
     final d = lin.data;
     double rSum = 0, gSum = 0, bSum = 0;
     int cnt = 0;
@@ -596,7 +628,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       _statusMessage =
           '자동 WB 적용됨: ${wbRes.temp}K, Tint ${wbRes.tint.toStringAsFixed(2)}';
     });
-    _triggerRender();
+    _triggerRender(fast: false);
   }
 
   /// 뷰포트 스포이드 클릭 시 해당 위치 5x5 평균 색상으로 화이트밸런스 계산
@@ -605,7 +637,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     if (photo == null) return;
     _pushUndoSnapshot();
 
-    final lin = srgb8ToLinear(photo.proxy);
+    final lin = srgb8ToLinear(photo.fastProxy);
     final geo = applyGeometry(lin, photo.params);
     final cx = (normX * (geo.width - 1)).round().clamp(0, geo.width - 1);
     final cy = (normY * (geo.height - 1)).round().clamp(0, geo.height - 1);
@@ -640,7 +672,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       _statusMessage =
           '스포이드 WB 적용됨: ${wbRes.temp}K, Tint ${wbRes.tint.toStringAsFixed(2)}';
     });
-    _triggerRender();
+    _triggerRender(fast: false);
   }
 
   /// 현재 설정 복사 / 붙여넣기 / 전체 사진에 적용
@@ -662,7 +694,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       );
       _statusMessage = '복사된 현상 설정을 붙여넣었습니다.';
     });
-    _triggerRender();
+    _triggerRender(fast: false);
   }
 
   void _pasteSettingsToAll() {
@@ -674,7 +706,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     setState(() {
       _statusMessage = '로드된 모든 사진(${_photos.length}장)에 설정을 일괄 적용했습니다.';
     });
-    _triggerRender();
+    _triggerRender(fast: false);
   }
 
   /// 프리셋 선택 및 적용
@@ -704,7 +736,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         _statusMessage = '프리셋 "$name" 적용 완료';
       });
     }
-    _triggerRender();
+    _triggerRender(fast: false);
   }
 
   /// 프리셋 관리 다이얼로그 (SemiDarktable PresetManagerDialog 1:1 이식)
@@ -1081,7 +1113,10 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         const SingleActivator(LogicalKeyboardKey.keyY, control: true): _redo,
         const SingleActivator(LogicalKeyboardKey.keyB): () {
           if (_currentPhoto != null) {
-            _updateParams((p) => p.splitViewEnabled = !p.splitViewEnabled);
+            _updateParams(
+              (p) => p.splitViewEnabled = !p.splitViewEnabled,
+              fast: false,
+            );
           }
         },
         const SingleActivator(LogicalKeyboardKey.keyG): () {
@@ -1102,74 +1137,92 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           },
           child: Scaffold(
             body: SafeArea(
-              child: Column(
-                children: [
-                  _buildTopActionToolbar(),
-                  Expanded(
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        final isCompact = constraints.maxWidth < 860;
-                        if (isCompact) {
-                          return Column(
-                            children: [
-                              Expanded(flex: 5, child: _buildCenterViewport()),
-                              Expanded(flex: 6, child: _buildRightInspector()),
-                            ],
-                          );
-                        }
-                        return Row(
-                          children: [
-                            Expanded(child: _buildCenterViewport()),
-                            SizedBox(
-                              width: 375,
-                              child: _buildRightInspector(),
-                            ),
-                          ],
-                        );
-                      },
-                    ),
-                  ),
-                  FilmstripWidget(
-                    items: _photos
-                        .map(
-                          (p) => FilmstripItemData(
-                            filePath: p.filePath,
-                            fileName: p.fileName,
-                            thumbnail: p.thumbnailImage,
+              child: LayoutBuilder(
+                builder: (context, rootConstraints) {
+                  // 창이 최소화되었거나 극단적으로 작아졌을 때 레이아웃 오버플로우/크래시 방지 가드
+                  if (rootConstraints.maxWidth < 120 ||
+                      rootConstraints.maxHeight < 120) {
+                    return const SizedBox.expand();
+                  }
+
+                  final showBottomBars = rootConstraints.maxHeight >= 220;
+                  final inspectorWidth =
+                      (rootConstraints.maxWidth * 0.34).clamp(270.0, 380.0);
+
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _buildTopActionToolbar(),
+                      Expanded(
+                        child: rootConstraints.maxWidth < 560
+                            ? Column(
+                                children: [
+                                  Expanded(
+                                    flex: 5,
+                                    child: _buildCenterViewport(),
+                                  ),
+                                  Expanded(
+                                    flex: 6,
+                                    child: _buildRightInspector(),
+                                  ),
+                                ],
+                              )
+                            : Row(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  Expanded(child: _buildCenterViewport()),
+                                  SizedBox(
+                                    width: inspectorWidth,
+                                    child: _buildRightInspector(),
+                                  ),
+                                ],
+                              ),
+                      ),
+                      if (showBottomBars)
+                        FilmstripWidget(
+                          items: _photos
+                              .map(
+                                (p) => FilmstripItemData(
+                                  filePath: p.filePath,
+                                  fileName: p.fileName,
+                                  thumbnail: p.thumbnailImage,
+                                ),
+                              )
+                              .toList(),
+                          currentIndex: _currentIndex,
+                          collapsed: _filmstripCollapsed,
+                          onToggleCollapse: () => setState(
+                            () => _filmstripCollapsed = !_filmstripCollapsed,
                           ),
-                        )
-                        .toList(),
-                    currentIndex: _currentIndex,
-                    collapsed: _filmstripCollapsed,
-                    onToggleCollapse: () => setState(
-                      () => _filmstripCollapsed = !_filmstripCollapsed,
-                    ),
-                    onSelect: (idx) {
-                      if (idx == _currentIndex) return;
-                      setState(() {
-                        _currentIndex = idx;
-                        final p = _currentPhoto!;
-                        _statusMessage =
-                            '${p.fileName} (${p.fullDecoded.width}×${p.fullDecoded.height})';
-                      });
-                      _triggerRender();
-                    },
-                    onRemove: (idx) {
-                      setState(() {
-                        _photos[idx].thumbnailImage?.dispose();
-                        _photos.removeAt(idx);
-                        if (_photos.isEmpty) {
-                          _currentIndex = -1;
-                        } else if (_currentIndex >= _photos.length) {
-                          _currentIndex = _photos.length - 1;
-                        }
-                      });
-                      _triggerRender();
-                    },
-                    onAddFiles: _pickAndLoadFiles,
-                  ),
-                  _buildBottomStatusBar(),
-                ],
+                          onSelect: (idx) {
+                            if (idx == _currentIndex) return;
+                            setState(() {
+                              _currentIndex = idx;
+                              final p = _currentPhoto!;
+                              _statusMessage =
+                                  '${p.fileName} (${p.fullDecoded.width}×${p.fullDecoded.height})';
+                            });
+                            _triggerRender(fast: false);
+                          },
+                          onRemove: (idx) {
+                            final removedThumb = _photos[idx].thumbnailImage;
+                            setState(() {
+                              _photos.removeAt(idx);
+                              if (_photos.isEmpty) {
+                                _currentIndex = -1;
+                              } else if (_currentIndex >= _photos.length) {
+                                _currentIndex = _photos.length - 1;
+                              }
+                            });
+                            _safeDisposeImage(removedThumb);
+                            _triggerRender(fast: false);
+                          },
+                          onAddFiles: _pickAndLoadFiles,
+                        ),
+                      if (showBottomBars) _buildBottomStatusBar(),
+                    ],
+                  );
+                },
               ),
             ),
           ),
@@ -1178,7 +1231,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     );
   }
 
-  /// SemiDarktable의 상단 헤더 툴바 1:1 이식
+  /// SemiDarktable의 상단 헤더 툴바 1:1 이식 (단일 42px 수평 바 고정 — 버튼이 가로 100%로 늘어나는 버그 완전 수정)
   Widget _buildTopActionToolbar() {
     final allPresets = [
       ...PresetService.builtinPresets.keys,
@@ -1189,143 +1242,156 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         : allPresets.first;
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      height: 42,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
       decoration: const BoxDecoration(
         color: Color(0xFF212121),
         border: Border(bottom: BorderSide(color: Color(0xFF333333))),
       ),
-      child: Wrap(
-        spacing: 6,
-        runSpacing: 6,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        children: [
-          const Padding(
-            padding: EdgeInsets.only(right: 6),
-            child: Text(
-              '⚡ PhotonRaw',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-                color: Color(0xFFE8A838),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(right: 10),
+              child: Text(
+                '⚡ PhotonRaw v1.0.4',
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFFE8A838),
+                ),
               ),
             ),
-          ),
-          _toolbarButton(
-            label: '📂 파일 열기',
-            tooltip: 'JPEG, PNG, TIFF 및 Sony ARW / Canon CR2 / Nikon NEF 등 열기',
-            primary: true,
-            onTap: _pickAndLoadFiles,
-          ),
-          _toolbarButton(
-            label: '💾 내보내기',
-            tooltip: 'JPEG, PNG, 16-bit Master TIFF 내보내기',
-            onTap: _showExportDialog,
-          ),
-          const SizedBox(width: 4),
-          _toolbarButton(
-            label: '📋 복사',
-            tooltip: '현재 현상 설정 복사',
-            onTap: _copySettings,
-          ),
-          _toolbarButton(
-            label: '📌 붙여넣기',
-            tooltip: '복사한 현상 설정을 현재 사진에 붙여넣기',
-            onTap: _pasteSettings,
-          ),
-          _toolbarButton(
-            label: '📌 전체 적용',
-            tooltip: '복사한 현상 설정을 로드된 모든 사진에 일괄 적용',
-            onTap: _pasteSettingsToAll,
-          ),
-          const SizedBox(width: 4),
-          Container(
-            height: 28,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF181818),
-              borderRadius: BorderRadius.circular(4),
-              border: Border.all(color: const Color(0xFF3A3A3A)),
+            _toolbarButton(
+              label: '📂 파일 열기',
+              tooltip: 'JPEG, PNG, TIFF 및 Sony ARW / Canon CR2 / Nikon NEF 등 열기',
+              primary: true,
+              onTap: _pickAndLoadFiles,
             ),
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<String>(
-                value: currentPresetVal,
-                dropdownColor: const Color(0xFF262626),
-                style: const TextStyle(fontSize: 11.5, color: Colors.white),
-                items: allPresets
-                    .map(
-                      (k) => DropdownMenuItem<String>(
-                        value: k,
-                        child: Text(k),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (val) {
-                  if (val != null) _applyPresetByName(val);
-                },
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '💾 내보내기',
+              tooltip: 'JPEG, PNG, 16-bit Master TIFF 내보내기',
+              onTap: _showExportDialog,
+            ),
+            const SizedBox(width: 10),
+            _toolbarButton(
+              label: '📋 복사',
+              tooltip: '현재 현상 설정 복사',
+              onTap: _copySettings,
+            ),
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '📌 붙여넣기',
+              tooltip: '복사한 현상 설정을 현재 사진에 붙여넣기',
+              onTap: _pasteSettings,
+            ),
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '📌 전체 적용',
+              tooltip: '복사한 현상 설정을 로드된 모든 사진에 일괄 적용',
+              onTap: _pasteSettingsToAll,
+            ),
+            const SizedBox(width: 10),
+            Container(
+              height: 28,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF181818),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: const Color(0xFF3A3A3A)),
+              ),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  value: currentPresetVal,
+                  isDense: true,
+                  dropdownColor: const Color(0xFF262626),
+                  style: const TextStyle(fontSize: 11.5, color: Colors.white),
+                  items: allPresets
+                      .map(
+                        (k) => DropdownMenuItem<String>(
+                          value: k,
+                          child: Text(k),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (val) {
+                    if (val != null) _applyPresetByName(val);
+                  },
+                ),
               ),
             ),
-          ),
-          _toolbarButton(
-            label: '⚙️ 프리셋 관리',
-            tooltip: '사용자 프리셋 저장/삭제 및 일괄 적용',
-            onTap: _showPresetManagerDialog,
-          ),
-          const SizedBox(width: 4),
-          _toolbarButton(
-            label: '↩ 실행취소',
-            tooltip: 'Ctrl+Z',
-            onTap: _undo,
-          ),
-          _toolbarButton(
-            label: '↪ 다시실행',
-            tooltip: 'Ctrl+Y',
-            onTap: _redo,
-          ),
-          _toolbarButton(
-            label: '👁 전/후 비교',
-            tooltip: 'Before / After 분할 비교 뷰 토글 (단축키 B)',
-            active: _params.splitViewEnabled,
-            onTap: () {
-              if (_currentPhoto != null) {
-                _updateParams(
-                  (p) => p.splitViewEnabled = !p.splitViewEnabled,
-                );
-              }
-            },
-          ),
-          _toolbarButton(
-            label: '🎯 소프트 프루핑',
-            tooltip: '8-bit sRGB / JPEG 압축 양자화 시뮬레이션 미리보기',
-            active: _softProofJpeg,
-            onTap: () {
-              setState(() => _softProofJpeg = !_softProofJpeg);
-              _triggerRender();
-            },
-          ),
-          _toolbarButton(
-            label: '🔄 전체 초기화',
-            tooltip: '현재 사진의 모든 보정값을 기본값으로 초기화',
-            onTap: () {
-              if (_currentPhoto == null) return;
-              _pushUndoSnapshot();
-              setState(() {
-                final asShotT = _currentPhoto!.params.wbAsShotTemp;
-                final asShotTint = _currentPhoto!.params.wbAsShotTint;
-                _currentPhoto!.params = PipelineParams()
-                  ..wbAsShotTemp = asShotT
-                  ..wbAsShotTint = asShotTint
-                  ..wbTemperature = asShotT
-                  ..wbTint = asShotTint;
-                _statusMessage = '모든 모듈이 초기화되었습니다.';
-              });
-              _triggerRender();
-            },
-          ),
-        ],
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '⚙️ 프리셋 관리',
+              tooltip: '사용자 프리셋 저장/삭제 및 일괄 적용',
+              onTap: _showPresetManagerDialog,
+            ),
+            const SizedBox(width: 10),
+            _toolbarButton(
+              label: '↩ 실행취소',
+              tooltip: 'Ctrl+Z',
+              onTap: _undo,
+            ),
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '↪ 다시실행',
+              tooltip: 'Ctrl+Y',
+              onTap: _redo,
+            ),
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '👁 전/후 비교',
+              tooltip: 'Before / After 분할 비교 뷰 토글 (단축키 B)',
+              active: _params.splitViewEnabled,
+              onTap: () {
+                if (_currentPhoto != null) {
+                  _updateParams(
+                    (p) => p.splitViewEnabled = !p.splitViewEnabled,
+                    fast: false,
+                  );
+                }
+              },
+            ),
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '🎯 소프트 프루핑',
+              tooltip: '8-bit sRGB / JPEG 압축 양자화 시뮬레이션 미리보기',
+              active: _softProofJpeg,
+              onTap: () {
+                setState(() => _softProofJpeg = !_softProofJpeg);
+                _triggerRender(fast: false);
+              },
+            ),
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '🔄 전체 초기화',
+              tooltip: '현재 사진의 모든 보정값을 기본값으로 초기화',
+              onTap: () {
+                if (_currentPhoto == null) return;
+                _pushUndoSnapshot();
+                setState(() {
+                  final asShotT = _currentPhoto!.params.wbAsShotTemp;
+                  final asShotTint = _currentPhoto!.params.wbAsShotTint;
+                  _currentPhoto!.params = PipelineParams()
+                    ..wbAsShotTemp = asShotT
+                    ..wbAsShotTint = asShotTint
+                    ..wbTemperature = asShotT
+                    ..wbTint = asShotTint;
+                  _statusMessage = '모든 모듈이 초기화되었습니다.';
+                });
+                _triggerRender(fast: false);
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
 
+  /// alignment: Alignment.center 대신 Row(mainAxisSize: MainAxisSize.min)을 사용하여 버튼이 자기 글자 폭만큼만 차지하도록 보장
   Widget _toolbarButton({
     required String label,
     required String tooltip,
@@ -1340,8 +1406,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         borderRadius: BorderRadius.circular(4),
         child: Container(
           height: 28,
-          padding: const EdgeInsets.symmetric(horizontal: 9),
-          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
           decoration: BoxDecoration(
             color: primary
                 ? const Color(0xFFE8A838)
@@ -1355,18 +1420,24 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                   : const Color(0xFF3E3E3E),
             ),
           ),
-          child: Text(
-            label,
-            style: TextStyle(
-              fontSize: 11.5,
-              fontWeight:
-                  primary || active ? FontWeight.bold : FontWeight.normal,
-              color: primary
-                  ? const Color(0xFF141414)
-                  : active
-                      ? const Color(0xFFE8A838)
-                      : const Color(0xFFE0E0E0),
-            ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight:
+                      primary || active ? FontWeight.bold : FontWeight.normal,
+                  color: primary
+                      ? const Color(0xFF141414)
+                      : active
+                          ? const Color(0xFFE8A838)
+                          : const Color(0xFFE0E0E0),
+                ),
+              ),
+            ],
           ),
         ),
       ),
@@ -1391,11 +1462,13 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           newSpotRadius: _newSpotRadius,
           onOpenFileRequested: _pickAndLoadFiles,
           onSplitPositionChanged: (pos) {
-            _updateParams((p) => p.splitPosition = pos);
+            setState(() {
+              _currentPhoto?.params.splitPosition = pos;
+            });
           },
           onCropRectChanged: (rect) {
-            _updateParams((p) {
-              p.cropRect = rect;
+            setState(() {
+              _currentPhoto?.params.cropRect = rect;
             });
           },
           onHorizonAngleComputed: (deg) {
@@ -1406,15 +1479,18 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               _statusMessage =
                   '수평선 자동 보정 적용됨: ${deg.toStringAsFixed(2)}°';
             });
-            _triggerRender();
+            _triggerRender(fast: false);
           },
           onWbSamplePicked: _handleWbSamplePicked,
           onSpotsChanged: (spots) {
             _pushUndoSnapshot();
-            _updateParams((p) {
-              p.spotEnabled = spots.isNotEmpty;
-              p.spots = spots;
-            });
+            _updateParams(
+              (p) {
+                p.spotEnabled = spots.isNotEmpty;
+                p.spots = spots;
+              },
+              fast: false,
+            );
           },
         ),
         if (_isLoadingFile)
@@ -1437,110 +1513,142 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     );
   }
 
-  /// 우측 다크룸 인스펙터 패널 (스코프 + 검색창 + 6개 카테고리 탭 + 18개 모듈 카드)
+  /// 우측 다크룸 인스펙터 패널 (창 세로 크기가 작아져도 절대 오버플로우가 나지 않도록 적응형 레이아웃 구성)
   Widget _buildRightInspector() {
     return Container(
       decoration: const BoxDecoration(
         color: Color(0xFF202020),
         border: Border(left: BorderSide(color: Color(0xFF333333))),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
-            child: ScopeAnalyzerWidget(scopeData: _scopeData),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            child: SizedBox(
-              height: 28,
-              child: TextField(
-                controller: _searchController,
-                style: const TextStyle(fontSize: 11.5),
-                decoration: InputDecoration(
-                  hintText: '🔍 모듈 검색 (예: 노출, 커브, 화이트밸런스, 선명도...)',
-                  hintStyle: const TextStyle(
-                    fontSize: 11,
-                    color: Color(0xFF777777),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final headerWidgets = <Widget>[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+              child: ScopeAnalyzerWidget(scopeData: _scopeData),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: SizedBox(
+                height: 28,
+                child: TextField(
+                  controller: _searchController,
+                  style: const TextStyle(fontSize: 11.5),
+                  decoration: InputDecoration(
+                    hintText: '🔍 모듈 검색 (예: 노출, 커브, 화이트밸런스, 선명도...)',
+                    hintStyle: const TextStyle(
+                      fontSize: 11,
+                      color: Color(0xFF777777),
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
+                    filled: true,
+                    fillColor: const Color(0xFF161616),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(4),
+                      borderSide: const BorderSide(color: Color(0xFF333333)),
+                    ),
+                    suffixIcon: _moduleSearchQuery.isNotEmpty
+                        ? IconButton(
+                            padding: EdgeInsets.zero,
+                            icon: const Icon(Icons.clear, size: 14),
+                            onPressed: () {
+                              _searchController.clear();
+                              setState(() => _moduleSearchQuery = '');
+                            },
+                          )
+                        : null,
                   ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 4,
-                  ),
-                  filled: true,
-                  fillColor: const Color(0xFF161616),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(4),
-                    borderSide: const BorderSide(color: Color(0xFF333333)),
-                  ),
-                  suffixIcon: _moduleSearchQuery.isNotEmpty
-                      ? IconButton(
-                          padding: EdgeInsets.zero,
-                          icon: const Icon(Icons.clear, size: 14),
-                          onPressed: () {
-                            _searchController.clear();
-                            setState(() => _moduleSearchQuery = '');
-                          },
-                        )
-                      : null,
+                  onChanged: (v) =>
+                      setState(() => _moduleSearchQuery = v.trim()),
                 ),
-                onChanged: (v) => setState(() => _moduleSearchQuery = v.trim()),
               ),
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            child: Row(
-              children: [
-                for (final tab in [
-                  ('all', '전체'),
-                  ('active', '활성'),
-                  ('tone', '톤/노출'),
-                  ('color', '색상'),
-                  ('geometry', '기하학'),
-                  ('detail', '디테일'),
-                ])
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 1.5),
-                      child: InkWell(
-                        onTap: () => setState(() => _activeCategory = tab.$1),
-                        borderRadius: BorderRadius.circular(4),
-                        child: Container(
-                          height: 25,
-                          alignment: Alignment.center,
-                          decoration: BoxDecoration(
-                            color: _activeCategory == tab.$1
-                                ? const Color(0xFFE8A838)
-                                : const Color(0xFF2B2B2B),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: SizedBox(
+                height: 25,
+                child: Row(
+                  children: [
+                    for (final tab in [
+                      ('all', '전체'),
+                      ('active', '활성'),
+                      ('tone', '톤/노출'),
+                      ('color', '색상'),
+                      ('geometry', '기하학'),
+                      ('detail', '디테일'),
+                    ])
+                      Expanded(
+                        child: Padding(
+                          padding:
+                              const EdgeInsets.symmetric(horizontal: 1.5),
+                          child: InkWell(
+                            onTap: () =>
+                                setState(() => _activeCategory = tab.$1),
                             borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: Text(
-                            tab.$2,
-                            style: TextStyle(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.bold,
-                              color: _activeCategory == tab.$1
-                                  ? const Color(0xFF141414)
-                                  : const Color(0xFFBBBBBB),
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: _activeCategory == tab.$1
+                                    ? const Color(0xFFE8A838)
+                                    : const Color(0xFF2B2B2B),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Center(
+                                child: Text(
+                                  tab.$2,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.bold,
+                                    color: _activeCategory == tab.$1
+                                        ? const Color(0xFF141414)
+                                        : const Color(0xFFBBBBBB),
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
                             ),
                           ),
                         ),
                       ),
-                    ),
+                  ],
+                ),
+              ),
+            ),
+            const Divider(height: 1, color: Color(0xFF333333)),
+          ];
+
+          // 창 높이가 340px 미만으로 줄어들었을 때는 헤더까지 함께 스크롤되도록 처리하여 오버플로우 방지
+          if (constraints.maxHeight < 340) {
+            return ListView(
+              padding: const EdgeInsets.only(bottom: 8),
+              children: [
+                ...headerWidgets,
+                Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: _buildAllModuleCards(),
                   ),
+                ),
               ],
-            ),
-          ),
-          const Divider(height: 1, color: Color(0xFF333333)),
-          Expanded(
-            child: ListView(
-              padding: const EdgeInsets.all(8),
-              children: _buildAllModuleCards(),
-            ),
-          ),
-        ],
+            );
+          }
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              ...headerWidgets,
+              Expanded(
+                child: ListView(
+                  padding: const EdgeInsets.all(8),
+                  children: _buildAllModuleCards(),
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -1567,23 +1675,29 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           enabled: geoActive,
           initiallyExpanded: false,
           onToggleEnabled: (val) {
-            _updateParams((params) {
-              params.cropEnabled = val;
-            }, recordUndo: true);
+            _updateParams(
+              (params) => params.cropEnabled = val,
+              recordUndo: true,
+              fast: false,
+            );
           },
           onReset: () {
             setState(() {
               _cropEditMode = false;
               _horizonMode = false;
             });
-            _updateParams((params) {
-              params.rotate90 = 0;
-              params.flipH = false;
-              params.flipV = false;
-              params.angle = 0.0;
-              params.cropEnabled = false;
-              params.cropRect = [0.0, 0.0, 1.0, 1.0];
-            }, recordUndo: true);
+            _updateParams(
+              (params) {
+                params.rotate90 = 0;
+                params.flipH = false;
+                params.flipV = false;
+                params.angle = 0.0;
+                params.cropEnabled = false;
+                params.cropRect = [0.0, 0.0, 1.0, 1.0];
+              },
+              recordUndo: true,
+              fast: false,
+            );
           },
           children: [
             Row(
@@ -1591,8 +1705,10 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 Expanded(
                   child: _smallBtn('↺ 90° 왼쪽', () {
                     _updateParams(
-                      (params) => params.rotate90 = (params.rotate90 + 270) % 360,
+                      (params) =>
+                          params.rotate90 = (params.rotate90 + 270) % 360,
                       recordUndo: true,
+                      fast: false,
                     );
                   }),
                 ),
@@ -1600,8 +1716,10 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 Expanded(
                   child: _smallBtn('↻ 90° 오른쪽', () {
                     _updateParams(
-                      (params) => params.rotate90 = (params.rotate90 + 90) % 360,
+                      (params) =>
+                          params.rotate90 = (params.rotate90 + 90) % 360,
                       recordUndo: true,
+                      fast: false,
                     );
                   }),
                 ),
@@ -1612,6 +1730,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                     () => _updateParams(
                       (params) => params.flipH = !params.flipH,
                       recordUndo: true,
+                      fast: false,
                     ),
                     active: p.flipH,
                   ),
@@ -1623,6 +1742,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                     () => _updateParams(
                       (params) => params.flipV = !params.flipV,
                       recordUndo: true,
+                      fast: false,
                     ),
                     active: p.flipV,
                   ),
@@ -1640,6 +1760,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               suffix: '°',
               onChangeStart: _pushUndoSnapshot,
               onChanged: (v) => _updateParams((params) => params.angle = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             const SizedBox(height: 4),
             Row(
@@ -1675,7 +1796,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                         _cropEditMode = !_cropEditMode;
                         if (_cropEditMode) _horizonMode = false;
                       });
-                      _triggerRender();
+                      _triggerRender(fast: false);
                     },
                     active: _cropEditMode,
                   ),
@@ -1689,6 +1810,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                       _updateParams(
                         (params) => params.cropEnabled = true,
                         recordUndo: true,
+                        fast: false,
                       );
                     },
                     active: p.cropEnabled && !_cropEditMode,
@@ -1717,8 +1839,10 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                         _cropEditMode = true;
                       });
                       if (ar.$2 != null && _currentPhoto != null) {
-                        final imgW = _currentPhoto!.proxy.width.toDouble();
-                        final imgH = _currentPhoto!.proxy.height.toDouble();
+                        final imgW =
+                            _currentPhoto!.fastProxy.width.toDouble();
+                        final imgH =
+                            _currentPhoto!.fastProxy.height.toDouble();
                         final imgAspect = imgW / imgH;
                         final targetNormRatio = ar.$2! / imgAspect;
                         double w = 0.8;
@@ -1729,11 +1853,12 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                         }
                         final x0 = (1.0 - w) * 0.5;
                         final y0 = (1.0 - h) * 0.5;
-                        _updateParams((params) {
-                          params.cropRect = [x0, y0, w, h];
-                        });
+                        _updateParams(
+                          (params) => params.cropRect = [x0, y0, w, h],
+                          fast: false,
+                        );
                       } else {
-                        _triggerRender();
+                        _triggerRender(fast: false);
                       }
                     },
                     child: Container(
@@ -1785,13 +1910,18 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.exposureEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.exposureEnabled = false;
-            params.expEv = 0.0;
-            params.expBlackLevel = 0.0;
-            params.expContrast = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.exposureEnabled = false;
+              params.expEv = 0.0;
+              params.expBlackLevel = 0.0;
+              params.expContrast = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             _smallBtn('⚡ 자동 노출 보정 (Auto Exposure)', _autoExposure),
             const SizedBox(height: 4),
@@ -1806,6 +1936,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.exposureEnabled = true,
               onChanged: (v) => _updateParams((params) => params.expEv = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '블랙 레벨 (Black Level)',
@@ -1819,6 +1950,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.exposureEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.expBlackLevel = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '대비 (Contrast)',
@@ -1832,6 +1964,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.exposureEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.expContrast = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -1853,26 +1986,35 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.sigmoidEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.sigmoidEnabled = false;
-            params.sigContrast = 1.0;
-            params.sigSkew = 0.0;
-            params.sigShoulder = 0.0;
-            params.sigToe = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.sigmoidEnabled = false;
+              params.sigContrast = 1.0;
+              params.sigSkew = 0.0;
+              params.sigShoulder = 0.0;
+              params.sigToe = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             SigmoidGraphWidget(
               contrast: p.sigContrast,
               skew: p.sigSkew,
               shoulder: p.sigShoulder,
               toe: p.sigToe,
-              onDoubleTapReset: () => _updateParams((params) {
-                params.sigContrast = 1.0;
-                params.sigSkew = 0.0;
-                params.sigShoulder = 0.0;
-                params.sigToe = 0.0;
-              }, recordUndo: true),
+              onDoubleTapReset: () => _updateParams(
+                (params) {
+                  params.sigContrast = 1.0;
+                  params.sigSkew = 0.0;
+                  params.sigShoulder = 0.0;
+                  params.sigToe = 0.0;
+                },
+                recordUndo: true,
+                fast: false,
+              ),
             ),
             ControlSlider(
               label: '곡선 대비 (Contrast)',
@@ -1885,6 +2027,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.sigmoidEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.sigContrast = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '비대칭 스큐 (Skew)',
@@ -1897,6 +2040,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.sigmoidEnabled = true,
               onChanged: (v) => _updateParams((params) => params.sigSkew = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '하이라이트 롤오프 (Shoulder)',
@@ -1910,6 +2054,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.sigmoidEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.sigShoulder = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '섀도우 리프트 (Toe)',
@@ -1922,6 +2067,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.sigmoidEnabled = true,
               onChanged: (v) => _updateParams((params) => params.sigToe = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -1943,15 +2089,20 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.toneEqualizerEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.toneEqualizerEnabled = false;
-            params.teBlacks = 0.0;
-            params.teShadows = 0.0;
-            params.teMidtones = 0.0;
-            params.teHighlights = 0.0;
-            params.teWhites = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.toneEqualizerEnabled = false;
+              params.teBlacks = 0.0;
+              params.teShadows = 0.0;
+              params.teMidtones = 0.0;
+              params.teHighlights = 0.0;
+              params.teWhites = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '블랙 (Blacks)',
@@ -1964,6 +2115,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.toneEqualizerEnabled = true,
               onChanged: (v) => _updateParams((params) => params.teBlacks = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '섀도우 (Shadows)',
@@ -1977,6 +2129,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.toneEqualizerEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.teShadows = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '미드톤 (Midtones)',
@@ -1990,6 +2143,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.toneEqualizerEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.teMidtones = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '하이라이트 (Highlights)',
@@ -2003,6 +2157,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.toneEqualizerEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.teHighlights = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '화이트 (Whites)',
@@ -2015,6 +2170,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.toneEqualizerEnabled = true,
               onChanged: (v) => _updateParams((params) => params.teWhites = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2036,17 +2192,22 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.toneCurveEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.toneCurveEnabled = false;
-            params.toneCurvePoints = {
-              for (final k in kCurveKeys)
-                k: [
-                  [0.0, 0.0],
-                  [1.0, 1.0],
-                ],
-            };
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.toneCurveEnabled = false;
+              params.toneCurvePoints = {
+                for (final k in kCurveKeys)
+                  k: [
+                    [0.0, 0.0],
+                    [1.0, 1.0],
+                  ],
+              };
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ToneCurveWidget(
               curvePoints: p.toneCurvePoints,
@@ -2055,6 +2216,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChanged: (updated) => _updateParams((params) {
                 params.toneCurvePoints = updated;
               }),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2076,12 +2238,17 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.highlightEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.highlightEnabled = false;
-            params.hlRecovery = 0.0;
-            params.hlCompress = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.highlightEnabled = false;
+              params.hlRecovery = 0.0;
+              params.hlCompress = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '복원 강도 (Recovery)',
@@ -2095,6 +2262,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.highlightEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.hlRecovery = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '하이라이트 압축 (Compress)',
@@ -2108,6 +2276,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.highlightEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.hlCompress = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2129,11 +2298,16 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.dehazeEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.dehazeEnabled = false;
-            params.dhStrength = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.dehazeEnabled = false;
+              params.dhStrength = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '안개 제거 강도 (Strength)',
@@ -2147,6 +2321,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.dehazeEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.dhStrength = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2168,12 +2343,17 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.wbEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.wbEnabled = false;
-            params.wbTemperature = params.wbAsShotTemp;
-            params.wbTint = params.wbAsShotTint;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.wbEnabled = false;
+              params.wbTemperature = params.wbAsShotTemp;
+              params.wbTint = params.wbAsShotTint;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             Row(
               children: [
@@ -2187,10 +2367,14 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 const SizedBox(width: 4),
                 Expanded(
                   child: _smallBtn('📷 촬영값', () {
-                    _updateParams((params) {
-                      params.wbTemperature = params.wbAsShotTemp;
-                      params.wbTint = params.wbAsShotTint;
-                    }, recordUndo: true);
+                    _updateParams(
+                      (params) {
+                        params.wbTemperature = params.wbAsShotTemp;
+                        params.wbTint = params.wbAsShotTint;
+                      },
+                      recordUndo: true,
+                      fast: false,
+                    );
                   }),
                 ),
                 const SizedBox(width: 4),
@@ -2212,6 +2396,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.wbEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.wbTemperature = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '틴트 (Tint G/M)',
@@ -2223,6 +2408,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.wbEnabled = true,
               onChanged: (v) => _updateParams((params) => params.wbTint = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2244,12 +2430,17 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.colorZonesEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.colorZonesEnabled = false;
-            params.satGlobal = 0.0;
-            params.satVibrance = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.colorZonesEnabled = false;
+              params.satGlobal = 0.0;
+              params.satVibrance = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '전체 채도 (Global Saturation)',
@@ -2262,6 +2453,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.colorZonesEnabled = true,
               onChanged: (v) => _updateParams((params) => params.satGlobal = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '바이브런스 (Vibrance)',
@@ -2275,6 +2467,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.colorZonesEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.satVibrance = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2296,13 +2489,18 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.colorEqualizerEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.colorEqualizerEnabled = false;
-            params.ceqHue = List<double>.filled(8, 0.0);
-            params.ceqSat = List<double>.filled(8, 0.0);
-            params.ceqBri = List<double>.filled(8, 0.0);
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.colorEqualizerEnabled = false;
+              params.ceqHue = List<double>.filled(8, 0.0);
+              params.ceqSat = List<double>.filled(8, 0.0);
+              params.ceqBri = List<double>.filled(8, 0.0);
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ColorEqualizerWidget(
               hue: p.ceqHue,
@@ -2315,6 +2513,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 params.ceqSat = s;
                 params.ceqBri = b;
               }),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2336,14 +2535,19 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.colorBalanceEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.colorBalanceEnabled = false;
-            params.cbShadowsR = 0.0;
-            params.cbMidtonesG = 0.0;
-            params.cbMidtonesB = 0.0;
-            params.cbHighlightsR = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.colorBalanceEnabled = false;
+              params.cbShadowsR = 0.0;
+              params.cbMidtonesG = 0.0;
+              params.cbMidtonesB = 0.0;
+              params.cbHighlightsR = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '섀도우 시안 ↔ 레드 (Shadows C/R)',
@@ -2357,6 +2561,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.colorBalanceEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.cbShadowsR = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '미드톤 마젠타 ↔ 그린 (Midtones M/G)',
@@ -2370,6 +2575,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.colorBalanceEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.cbMidtonesG = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '미드톤 옐로우 ↔ 블루 (Midtones Y/B)',
@@ -2383,6 +2589,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.colorBalanceEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.cbMidtonesB = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '하이라이트 시안 ↔ 레드 (Highlights C/R)',
@@ -2396,6 +2603,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.colorBalanceEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.cbHighlightsR = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2417,11 +2625,16 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.sharpenEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.sharpenEnabled = false;
-            params.shAmount = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.sharpenEnabled = false;
+              params.shAmount = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '샤프닝 양 (Amount)',
@@ -2434,6 +2647,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.sharpenEnabled = true,
               onChanged: (v) => _updateParams((params) => params.shAmount = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2455,12 +2669,17 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.localContrastEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.localContrastEnabled = false;
-            params.lcDetail = 0.0;
-            params.lcClarity = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.localContrastEnabled = false;
+              params.lcDetail = 0.0;
+              params.lcClarity = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '미세 디테일 (Fine Detail)',
@@ -2473,6 +2692,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.localContrastEnabled = true,
               onChanged: (v) => _updateParams((params) => params.lcDetail = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '클래리티 (Clarity)',
@@ -2485,6 +2705,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.localContrastEnabled = true,
               onChanged: (v) => _updateParams((params) => params.lcClarity = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2506,11 +2727,16 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.denoiseEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.denoiseEnabled = false;
-            params.dnStrength = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.denoiseEnabled = false;
+              params.dnStrength = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '노이즈 억제 강도 (Strength)',
@@ -2524,6 +2750,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.denoiseEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.dnStrength = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2545,12 +2772,17 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.defringeEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.defringeEnabled = false;
-            params.dfStrength = 0.0;
-            params.dfThreshold = 0.10;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.defringeEnabled = false;
+              params.dfStrength = 0.0;
+              params.dfThreshold = 0.10;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '제거 강도 (Strength)',
@@ -2564,6 +2796,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.defringeEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.dfStrength = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
               label: '엣지 임계값 (Threshold)',
@@ -2577,6 +2810,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.defringeEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.dfThreshold = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2598,13 +2832,18 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.spotEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
           onReset: () {
             setState(() => _spotEditMode = false);
-            _updateParams((params) {
-              params.spotEnabled = false;
-              params.spots = [];
-            }, recordUndo: true);
+            _updateParams(
+              (params) {
+                params.spotEnabled = false;
+                params.spots = [];
+              },
+              recordUndo: true,
+              fast: false,
+            );
           },
           children: [
             _smallBtn(
@@ -2630,19 +2869,27 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 Expanded(
                   child: _smallBtn('마지막 스팟 삭제', () {
                     if (p.spots.isEmpty) return;
-                    _updateParams((params) {
-                      params.spots.removeLast();
-                      if (params.spots.isEmpty) params.spotEnabled = false;
-                    }, recordUndo: true);
+                    _updateParams(
+                      (params) {
+                        params.spots.removeLast();
+                        if (params.spots.isEmpty) params.spotEnabled = false;
+                      },
+                      recordUndo: true,
+                      fast: false,
+                    );
                   }),
                 ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: _smallBtn('모든 스팟 초기화 (${p.spots.length})', () {
-                    _updateParams((params) {
-                      params.spots.clear();
-                      params.spotEnabled = false;
-                    }, recordUndo: true);
+                    _updateParams(
+                      (params) {
+                        params.spots.clear();
+                        params.spotEnabled = false;
+                      },
+                      recordUndo: true,
+                      fast: false,
+                    );
                   }),
                 ),
               ],
@@ -2667,11 +2914,16 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.blurEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.blurEnabled = false;
-            params.blurRadius = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.blurEnabled = false;
+              params.blurRadius = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '블러 반경 (Radius)',
@@ -2685,6 +2937,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.blurEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.blurRadius = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2706,11 +2959,16 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.grainEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.grainEnabled = false;
-            params.grAmount = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.grainEnabled = false;
+              params.grAmount = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '입자 강도 (Amount)',
@@ -2723,6 +2981,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.grainEnabled = true,
               onChanged: (v) => _updateParams((params) => params.grAmount = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2744,11 +3003,16 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onToggleEnabled: (v) => _updateParams(
             (params) => params.vignetteEnabled = v,
             recordUndo: true,
+            fast: false,
           ),
-          onReset: () => _updateParams((params) {
-            params.vignetteEnabled = false;
-            params.vgAmount = 0.0;
-          }, recordUndo: true),
+          onReset: () => _updateParams(
+            (params) {
+              params.vignetteEnabled = false;
+              params.vgAmount = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
           children: [
             ControlSlider(
               label: '비네팅 양 (어둡게 - ↔ + 밝게)',
@@ -2761,6 +3025,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.vignetteEnabled = true,
               onChanged: (v) => _updateParams((params) => params.vgAmount = v),
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
         ),
@@ -2795,7 +3060,6 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       child: Container(
         height: 26,
         padding: const EdgeInsets.symmetric(horizontal: 8),
-        alignment: Alignment.center,
         decoration: BoxDecoration(
           color: active ? const Color(0xFF3E3524) : const Color(0xFF1E1E1E),
           borderRadius: BorderRadius.circular(4),
@@ -2803,14 +3067,16 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             color: active ? const Color(0xFFE8A838) : const Color(0xFF3A3A3A),
           ),
         ),
-        child: Text(
-          text,
-          style: TextStyle(
-            fontSize: 11,
-            fontWeight: active ? FontWeight.bold : FontWeight.normal,
-            color: active ? const Color(0xFFE8A838) : const Color(0xFFCCCCCC),
+        child: Center(
+          child: Text(
+            text,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: active ? FontWeight.bold : FontWeight.normal,
+              color: active ? const Color(0xFFE8A838) : const Color(0xFFCCCCCC),
+            ),
+            overflow: TextOverflow.ellipsis,
           ),
-          overflow: TextOverflow.ellipsis,
         ),
       ),
     );

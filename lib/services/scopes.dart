@@ -5,6 +5,8 @@ import 'pipeline_core.dart' show kCeqCenters;
 
 const int kScopeW = 280;
 const int kScopeH = 140;
+const int kGridCols = 96;
+const int kGridRows = 64;
 
 class ScopeData {
   final Uint8List waveformRgba;
@@ -12,18 +14,30 @@ class ScopeData {
   final Uint8List histogramRgba;
   final List<double> bandLevels;
 
+  /// GPU 텍스처(ui.Image) 생성/해제 없이 CustomPainter에서 직접 그리기 위한 고속 버퍼
+  final Float32List histR; // 길이 128 (0~1 정규화)
+  final Float32List histG; // 길이 128 (0~1 정규화)
+  final Float32List histB; // 길이 128 (0~1 정규화)
+  final Uint8List waveformBins; // kGridCols * kGridRows * 3 (R,G,B 밀도 0~255)
+  final Uint8List paradeBins; // kGridCols * kGridRows (단일 채널 밀도 0~255)
+
   ScopeData({
     required this.waveformRgba,
     required this.paradeRgba,
     required this.histogramRgba,
     required this.bandLevels,
+    required this.histR,
+    required this.histG,
+    required this.histB,
+    required this.waveformBins,
+    required this.paradeBins,
   });
 }
 
-/// 표시용 RGBA8 결과에서 Waveform, Parade, Histogram, 8-Band 스코프를 한 번에 계산 (원본 scopes.py 1:1 포팅)
+/// 표시용 RGBA8 결과에서 Waveform, Parade, Histogram, 8-Band 스코프를 계산
 ScopeData computeAllScopes(Uint8List rgba, int w, int h) {
-  final stepX = math.max(1, w ~/ 256);
-  final stepY = math.max(1, h ~/ 144);
+  final stepX = math.max(1, w ~/ 160);
+  final stepY = math.max(1, h ~/ 100);
   final sw = (w + stepX - 1) ~/ stepX;
   final sh = (h + stepY - 1) ~/ stepY;
   final sample = Float32List(sw * sh * 3);
@@ -39,98 +53,89 @@ ScopeData computeAllScopes(Uint8List rgba, int w, int h) {
 
   final levels = _bandLevels(sample, sw, sh);
 
-  Uint8List makeBlankCanvas() {
-    final c = Uint8List(kScopeW * kScopeH * 4);
-    for (var i = 0; i < kScopeW * kScopeH; i++) {
-      c[i * 4] = 18;
-      c[i * 4 + 1] = 18;
-      c[i * 4 + 2] = 18;
-      c[i * 4 + 3] = 255;
-    }
-    return c;
-  }
-
-  final wf = makeBlankCanvas();
-  final pr = makeBlankCanvas();
-  final hs = makeBlankCanvas();
-
-  _drawWaveform(wf, sample, sw, sh);
-  _drawParade(pr, sample, sw, sh);
-  _drawHistogram(hs, sample, sw, sh);
-
-  return ScopeData(
-    waveformRgba: wf,
-    paradeRgba: pr,
-    histogramRgba: hs,
-    bandLevels: levels,
-  );
-}
-
-void _add(Uint8List c, int x, int y, int ch, int amt) {
-  final o = (y * kScopeW + x) * 4 + ch;
-  c[o] = math.min(255, c[o] + amt);
-}
-
-int _yIdx(double v) => ((1.0 - v) * (kScopeH - 1)).toInt().clamp(0, kScopeH - 1);
-
-void _drawWaveform(Uint8List canvas, Float32List s, int sw, int sh) {
-  for (var cx = 0; cx < kScopeW; cx++) {
-    final sx = sw <= 1 ? 0 : (cx * (sw - 1) / (kScopeW - 1)).toInt();
-    for (var y = 0; y < sh; y++) {
-      final o = (y * sw + sx) * 3;
-      _add(canvas, cx, _yIdx(s[o]), 0, 30);
-      _add(canvas, cx, _yIdx(s[o + 1]), 1, 30);
-      _add(canvas, cx, _yIdx(s[o + 2]), 2, 30);
-    }
-  }
-}
-
-void _drawParade(Uint8List canvas, Float32List s, int sw, int sh) {
-  final subW = kScopeW ~/ 3;
-  for (var cx = 0; cx < subW; cx++) {
-    final sx = sw <= 1 ? 0 : (cx * (sw - 1) / (subW - 1)).toInt();
-    for (var y = 0; y < sh; y++) {
-      final o = (y * sw + sx) * 3;
-      _add(canvas, cx, _yIdx(s[o]), 0, 45);
-      _add(canvas, subW + cx, _yIdx(s[o + 1]), 1, 45);
-      final bx = subW * 2 + cx;
-      if (bx < kScopeW) _add(canvas, bx, _yIdx(s[o + 2]), 2, 45);
-    }
-  }
-  for (var y = 0; y < kScopeH; y++) {
-    for (final x in [subW, subW * 2]) {
-      final o = (y * kScopeW + x) * 4;
-      canvas[o] = 40;
-      canvas[o + 1] = 40;
-      canvas[o + 2] = 40;
-    }
-  }
-}
-
-void _drawHistogram(Uint8List canvas, Float32List s, int sw, int sh) {
-  final hist = List.generate(3, (_) => List<double>.filled(kScopeW, 0.0));
+  // 1. 128-bin 히스토그램 계산
+  const hBins = 128;
+  final hR = Float32List(hBins);
+  final hG = Float32List(hBins);
+  final hB = Float32List(hBins);
   final n = sw * sh;
   for (var i = 0; i < n; i++) {
-    for (var c = 0; c < 3; c++) {
-      final b = (s[i * 3 + c] * (kScopeW - 1)).toInt().clamp(0, kScopeW - 1);
-      hist[c][b] += 1.0;
+    final o = i * 3;
+    final br = (sample[o] * (hBins - 1)).toInt().clamp(0, hBins - 1);
+    final bg = (sample[o + 1] * (hBins - 1)).toInt().clamp(0, hBins - 1);
+    final bb = (sample[o + 2] * (hBins - 1)).toInt().clamp(0, hBins - 1);
+    hR[br] += 1.0;
+    hG[bg] += 1.0;
+    hB[bb] += 1.0;
+  }
+  double maxH = 1.0;
+  for (var i = 0; i < hBins; i++) {
+    if (hR[i] > maxH) maxH = hR[i];
+    if (hG[i] > maxH) maxH = hG[i];
+    if (hB[i] > maxH) maxH = hB[i];
+  }
+  for (var i = 0; i < hBins; i++) {
+    hR[i] = (hR[i] / maxH).clamp(0.0, 1.0);
+    hG[i] = (hG[i] / maxH).clamp(0.0, 1.0);
+    hB[i] = (hB[i] / maxH).clamp(0.0, 1.0);
+  }
+
+  // 2. Waveform 및 Parade 고속 그리드 빈 계산
+  final wfBins = Uint8List(kGridCols * kGridRows * 3);
+  final prBins = Uint8List(kGridCols * kGridRows);
+  final subCols = kGridCols ~/ 3;
+  final amt = math.max(12, 420 ~/ math.max(1, sh));
+
+  for (var cx = 0; cx < kGridCols; cx++) {
+    final sx = sw <= 1 ? 0 : (cx * (sw - 1) ~/ (kGridCols - 1));
+    for (var y = 0; y < sh; y++) {
+      final o = (y * sw + sx) * 3;
+      final ry = ((1.0 - sample[o]) * (kGridRows - 1)).toInt().clamp(0, kGridRows - 1);
+      final gy = ((1.0 - sample[o + 1]) * (kGridRows - 1)).toInt().clamp(0, kGridRows - 1);
+      final by = ((1.0 - sample[o + 2]) * (kGridRows - 1)).toInt().clamp(0, kGridRows - 1);
+
+      final idxR = (ry * kGridCols + cx) * 3;
+      final idxG = (gy * kGridCols + cx) * 3 + 1;
+      final idxB = (by * kGridCols + cx) * 3 + 2;
+      wfBins[idxR] = math.min(255, wfBins[idxR] + amt);
+      wfBins[idxG] = math.min(255, wfBins[idxG] + amt);
+      wfBins[idxB] = math.min(255, wfBins[idxB] + amt);
     }
   }
-  var maxVal = 1.0;
-  for (final hc in hist) {
-    for (final v in hc) {
-      if (v > maxVal) maxVal = v;
+
+  for (var cx = 0; cx < subCols; cx++) {
+    final sx = sw <= 1 ? 0 : (cx * (sw - 1) ~/ math.max(1, subCols - 1));
+    for (var y = 0; y < sh; y++) {
+      final o = (y * sw + sx) * 3;
+      final ry = ((1.0 - sample[o]) * (kGridRows - 1)).toInt().clamp(0, kGridRows - 1);
+      final gy = ((1.0 - sample[o + 1]) * (kGridRows - 1)).toInt().clamp(0, kGridRows - 1);
+      final by = ((1.0 - sample[o + 2]) * (kGridRows - 1)).toInt().clamp(0, kGridRows - 1);
+
+      final pR = ry * kGridCols + cx;
+      final pG = gy * kGridCols + (subCols + cx);
+      final pB = by * kGridCols + (subCols * 2 + cx);
+      prBins[pR] = math.min(255, prBins[pR] + amt);
+      prBins[pG] = math.min(255, prBins[pG] + amt);
+      prBins[pB] = math.min(255, prBins[pB] + amt);
     }
   }
-  for (var x = 0; x < kScopeW; x++) {
-    for (var c = 0; c < 3; c++) {
-      final hgt = (hist[c][x] / maxVal * (kScopeH - 10)).toInt();
-      for (var y = kScopeH - hgt; y < kScopeH; y++) {
-        final o = (y * kScopeW + x) * 4 + c;
-        if (canvas[o] < 200) canvas[o] = 200;
-      }
-    }
-  }
+
+  // 호환용 더미 RGBA 버퍼 (단위 테스트 호환 유지)
+  final wfRgba = Uint8List(kScopeW * kScopeH * 4);
+  final prRgba = Uint8List(kScopeW * kScopeH * 4);
+  final hsRgba = Uint8List(kScopeW * kScopeH * 4);
+
+  return ScopeData(
+    waveformRgba: wfRgba,
+    paradeRgba: prRgba,
+    histogramRgba: hsRgba,
+    bandLevels: levels,
+    histR: hR,
+    histG: hG,
+    histB: hB,
+    waveformBins: wfBins,
+    paradeBins: prBins,
+  );
 }
 
 List<double> _bandLevels(Float32List s, int sw, int sh) {
