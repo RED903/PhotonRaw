@@ -39,6 +39,7 @@ dependencies:
   path_provider: ^2.1.6
   ffi: ^2.2.0
   provider: ^6.1.5+1
+  desktop_drop: ^0.8.0
 
 dev_dependencies:
   flutter_test:

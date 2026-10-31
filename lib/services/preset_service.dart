@@ -31,17 +31,17 @@ class PresetService {
         description: '푸른 하늘과 싱그러운 자연의 생생하고 쨍한 색감',
         params: PipelineParams()
           ..exposureEnabled = true
-          ..exposureEv = 0.0
+          ..expEv = 0.0
           ..blackLevel = 0.02
           ..contrast = 0.2
           ..sigmoidEnabled = true
           ..sigContrast = 1.25
           ..sigShoulder = 0.15
           ..sigToe = 0.1
-          ..vibrance = 30.0
-          ..saturation = 20.0
-          ..highlights = -15.0
-          ..shadows = 15.0,
+          ..satVibrance = 0.3
+          ..satGlobal = 0.2
+          ..teHighlights = -0.15
+          ..teShadows = 0.15,
       ),
       Preset(
         id: 'warm_portrait',
@@ -49,20 +49,21 @@ class PresetService {
         description: '자연스럽고 화사한 스킨톤 + 부드러운 하이라이트',
         params: PipelineParams()
           ..exposureEnabled = true
-          ..exposureEv = 0.3
+          ..expEv = 0.3
           ..blackLevel = -0.02
           ..contrast = -0.05
-          ..temperature = 18.0
-          ..tint = 6.0
+          ..wbEnabled = true
+          ..wbTemperature = 6600.0
+          ..wbTint = 0.06
           ..sigmoidEnabled = true
           ..sigContrast = 1.05
           ..sigSkew = 0.15
           ..sigShoulder = 0.35
           ..sigToe = 0.05
-          ..vibrance = 10.0
-          ..saturation = 5.0
-          ..highlights = -20.0
-          ..shadows = 10.0,
+          ..satVibrance = 0.1
+          ..satGlobal = 0.05
+          ..teHighlights = -0.2
+          ..teShadows = 0.1,
       ),
       Preset(
         id: 'modern_film',
@@ -70,19 +71,20 @@ class PresetService {
         description: '부드러운 하이라이트 페이드 + 따뜻한 골드 섀도우',
         params: PipelineParams()
           ..exposureEnabled = true
-          ..exposureEv = 0.15
+          ..expEv = 0.15
           ..blackLevel = 0.05
           ..contrast = 0.1
-          ..temperature = 12.0
-          ..tint = 4.0
+          ..wbEnabled = true
+          ..wbTemperature = 6200.0
+          ..wbTint = 0.04
           ..sigmoidEnabled = true
           ..sigContrast = 1.15
           ..sigSkew = 0.1
           ..sigShoulder = 0.2
           ..sigToe = 0.15
-          ..vibrance = -5.0
-          ..saturation = -10.0
-          ..shadows = 20.0,
+          ..satVibrance = -0.05
+          ..satGlobal = -0.1
+          ..teShadows = 0.2,
       ),
       Preset(
         id: 'cinematic_moody',
@@ -90,20 +92,21 @@ class PresetService {
         description: '깊은 섀도우 틸/오렌지 색감 + 짙은 시네마 분위기',
         params: PipelineParams()
           ..exposureEnabled = true
-          ..exposureEv = -0.2
+          ..expEv = -0.2
           ..blackLevel = 0.08
           ..contrast = 0.25
-          ..temperature = 8.0
-          ..tint = -5.0
+          ..wbEnabled = true
+          ..wbTemperature = 5800.0
+          ..wbTint = -0.02
           ..sigmoidEnabled = true
           ..sigContrast = 1.3
           ..sigSkew = -0.1
           ..sigShoulder = 0.1
           ..sigToe = 0.2
-          ..highlights = -25.0
-          ..shadows = -10.0
-          ..vibrance = 15.0
-          ..saturation = 10.0,
+          ..teHighlights = -0.25
+          ..teShadows = -0.1
+          ..satVibrance = 0.15
+          ..satGlobal = 0.1,
       ),
       Preset(
         id: 'bw_fineart',
@@ -111,17 +114,18 @@ class PresetService {
         description: '강렬한 대비와 깊은 톤의 클래식 흑백',
         params: PipelineParams()
           ..exposureEnabled = true
-          ..exposureEv = 0.1
+          ..expEv = 0.1
           ..blackLevel = 0.06
           ..contrast = 0.35
-          ..saturation = -100.0
-          ..vibrance = 0.0
+          ..colorZonesEnabled = true
+          ..satGlobal = -1.0
+          ..satVibrance = 0.0
           ..sigmoidEnabled = true
           ..sigContrast = 1.4
           ..sigShoulder = 0.2
           ..sigToe = 0.2
-          ..highlights = 10.0
-          ..shadows = -15.0,
+          ..teHighlights = 0.1
+          ..teShadows = -0.15,
       ),
     ];
   }
