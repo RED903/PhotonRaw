@@ -1,13 +1,21 @@
 # PhotonRaw (포톤 로우)
-> **iOS, macOS, Android, Windows, Web** 모든 플랫폼을 지원하는 고성능 32-bit Float RAW 사진 현상 스튜디오
+> **Android, iOS, macOS, Windows** 4대 플랫폼을 지원하는 순수 네이티브 32-bit Float RAW 사진 현상 스튜디오
 
-기존 **SemiDarktable**의 32비트 무손실 연산 파이프라인, 정밀 노출 제어, 시그모이드(Sigmoid) 톤 매핑 및 특화 프리셋 시스템을 완벽하게 계승하여 Flutter 크로스 플랫폼으로 새로 제작된 프로젝트입니다.
+기존 **SemiDarktable**의 32비트 무손실 연산 파이프라인, 정밀 노출 제어, 시그모이드(Sigmoid) 톤 매핑 및 특화 프리셋 시스템을 완벽하게 계승하여 제작된 고성능 순수 네이티브 앱입니다. 대용량 RAW 파일 처리를 위해 웹(브라우저) 샌드박스를 배제하고 OS 직접 메모리 할당 기반 네이티브 엔진으로 동작합니다.
+
+---
+
+## 🌟 지원 플랫폼 및 네이티브 설치 파일
+- 📱 **Android**: `PhotonRaw-Android.apk` (안드로이드 폰/태블릿)
+- 🍏 **iOS**: `PhotonRaw-iOS.ipa` (AltStore / Sideloadly 등을 통한 순정 아이폰 설치)
+- 🖥️ **Windows**: `PhotonRaw-Windows-x64.zip` (윈도우 64-bit 실행 파일)
+- 🍎 **macOS**: `PhotonRaw-macOS.zip` (Mac 데스크톱 앱)
 
 ---
 
 ## 🌟 주요 기능
-1. **완전한 크로스 플랫폼 지원**:
-   - iPhone (iOS), Mac (macOS), Android 폰/태블릿, Windows PC, 웹(Web)까지 동일한 단일 코드베이스로 작동
+1. **OS 직접 메모리 할당 (순수 네이티브)**:
+   - 4500만 화소 이상의 고해상도 RAW 파일도 브라우저 메모리 제한 없이 안정적으로 처리
 2. **32-bit Float 정밀 파이프라인**:
    - 노출(Exposure EV, Contrast, Black Level)
    - 화이트 밸런스(색온도 Temperature, 틴트 Tint)
@@ -31,32 +39,13 @@
 
 ---
 
-## 🚀 실행 및 빌드 방법
+## 🚀 GitHub 자동 빌드 및 다운로드 방법
+GitHub에 태그를 푸시하면 GitHub 클라우드 머신이 자동으로 4대 플랫폼 바이너리를 빌드하여 **Releases** 탭에 올려줍니다.
 
-### 1. Windows 데스크톱에서 바로 실행
-- 폴더 내 `run_photonraw.bat`을 더블 클릭하거나 명령 프롬프트에서:
 ```bash
-flutter run -d windows
+git add .
+git commit -m "release: v1.0.0"
+git tag v1.0.0
+git push origin main --tags
 ```
-
-### 2. 안드로이드 (Android) 빌드 및 실행
-```bash
-flutter run -d android
-flutter build apk --release
-```
-
-### 3. 아이폰 (iOS) 및 맥 (macOS) 빌드
-> iOS/macOS 빌드는 Apple 정책상 macOS 환경(Xcode 설치)에서 실행해야 합니다.
-```bash
-# macOS 데스크톱 실행
-flutter run -d macos
-
-# iPhone / iPad 실행
-flutter run -d ios
-flutter build ipa
-```
-
-### 4. 웹 브라우저에서 실행
-```bash
-flutter run -d chrome
-```
+빌드 완료 후 GitHub 저장소의 **[Releases]**에서 APK, IPA, ZIP 파일을 다운로드하여 각 기기에서 바로 설치할 수 있습니다.

@@ -1,9 +1,9 @@
-name: Build Multi-Platform Releases (APK, Windows, macOS, Web)
+name: Build Native Releases (Android, Windows, macOS, iOS)
 
 on:
   push:
     tags:
-      - 'v*' # v1.0.0 같은 태그를 푸시하면 자동 빌드 시작
+      - 'v*' # v1.0.0 같은 버전 태그를 푸시하면 4대 네이티브 바이너리 빌드 시작
   workflow_dispatch: # GitHub 웹사이트에서 버튼 클릭으로도 수동 빌드 가능
 
 permissions:
@@ -110,10 +110,44 @@ jobs:
           name: PhotonRaw-macOS
           path: PhotonRaw-macOS.zip
 
-  # 4. GitHub Release 생성 및 파일 자동 첨부
+  # 4. iOS IPA (사이드로딩/AltStore/Sideloadly용) 빌드
+  build-ios:
+    name: Build iOS IPA
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Get Dependencies
+        run: flutter pub get
+
+      - name: Build iOS (No Codesign)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package into IPA
+        run: |
+          mkdir -p build/ios/iphoneos/Payload
+          cp -r build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
+          cd build/ios/iphoneos
+          zip -r ../../../PhotonRaw-iOS.ipa Payload
+          cd ../../..
+
+      - name: Upload iOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotonRaw-iOS
+          path: PhotonRaw-iOS.ipa
+
+  # 5. GitHub Release 생성 및 4대 네이티브 파일 자동 업로드
   create-release:
     name: Create GitHub Release
-    needs: [build-android, build-windows, build-macos]
+    needs: [build-android, build-windows, build-macos, build-ios]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -136,6 +170,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: PhotonRaw-macOS
+          path: release-assets
+
+      - name: Download iOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PhotonRaw-iOS
           path: release-assets
 
       - name: Rename Android APK
