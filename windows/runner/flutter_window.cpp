@@ -51,6 +51,12 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // Windows UIAutomation / IME의 WM_GETOBJECT 요청으로 인해 flutter_windows.dll 내부
+  // AccessibilityBridge(0x3c1ca)에서 창 크기 변경 시 발생하는 NULL 역참조 크래시 원천 차단
+  if (message == WM_GETOBJECT) {
+    return 0;
+  }
+
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =
@@ -63,7 +69,9 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
 
   switch (message) {
     case WM_FONTCHANGE:
-      flutter_controller_->engine()->ReloadSystemFonts();
+      if (flutter_controller_ && flutter_controller_->engine()) {
+        flutter_controller_->engine()->ReloadSystemFonts();
+      }
       break;
   }
 

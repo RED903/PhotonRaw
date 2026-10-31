@@ -2,6 +2,8 @@
 
 #include <dwmapi.h>
 #include <flutter_windows.h>
+#include <algorithm>
+#include <cstdint>
 
 #include "resource.h"
 
@@ -28,6 +30,54 @@ constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme"
 
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
+
+// Flutter 자식 뷰(FLUTTERVIEW)의 원본 WndProc 포인터
+static WNDPROC g_original_child_wndproc = nullptr;
+
+// VEH(Vectored Exception Handler) 등록 여부
+static PVOID g_veh_handle = nullptr;
+
+// flutter_windows.dll 내부 AccessibilityBridge::CommitUpdates(RVA 0x3c1ca)에서
+// ax_node_(rax)가 NULL일 때 발생하는 Access Violation(0xc0000005)을 즉시 복구하는 핸들러
+LONG CALLBACK FlutterEngineCrashGuard(PEXCEPTION_POINTERS ep) noexcept {
+  if (ep != nullptr && ep->ExceptionRecord != nullptr &&
+      ep->ContextRecord != nullptr &&
+      ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+    HMODULE h_flutter = GetModuleHandleW(L"flutter_windows.dll");
+    if (h_flutter != nullptr) {
+      const auto base = reinterpret_cast<uintptr_t>(h_flutter);
+      const uintptr_t rip = ep->ContextRecord->Rip;
+      // RVA 0x3c1ca: mov eax, dword ptr [rax + 0x48] (rax == 0 인 경우 RVA 0x3c2ad로 스킵)
+      if (rip == base + 0x3c1ca && ep->ContextRecord->Rax == 0) {
+        ep->ContextRecord->Rip = base + 0x3c2ad;
+        return EXCEPTION_CONTINUE_EXECUTION;
+      }
+    }
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// 자식 뷰(FLUTTERVIEW) WndProc에서 WM_GETOBJECT(0x003D) 및 0 크기 WM_SIZE를 차단하여
+// Windows UIAutomation/IME가 AccessibilityBridge를 활성화하지 않도록 원천 방지
+LRESULT CALLBACK SafeChildWndProc(HWND hwnd,
+                                  UINT message,
+                                  WPARAM wparam,
+                                  LPARAM lparam) noexcept {
+  if (message == WM_GETOBJECT) {
+    return 0;
+  }
+  if (message == WM_SIZE) {
+    if (wparam == SIZE_MINIMIZED || LOWORD(lparam) == 0 ||
+        HIWORD(lparam) == 0) {
+      return 0;
+    }
+  }
+  WNDPROC orig = g_original_child_wndproc;
+  if (!orig) {
+    return DefWindowProc(hwnd, message, wparam, lparam);
+  }
+  return CallWindowProc(orig, hwnd, message, wparam, lparam);
+}
 
 using EnableNonClientDpiScaling = BOOL __stdcall(HWND hwnd);
 
@@ -112,6 +162,9 @@ void WindowClassRegistrar::UnregisterWindowClass() {
 }
 
 Win32Window::Win32Window() {
+  if (g_veh_handle == nullptr) {
+    g_veh_handle = AddVectoredExceptionHandler(1, FlutterEngineCrashGuard);
+  }
   ++g_active_window_count;
 }
 
@@ -158,6 +211,9 @@ LRESULT CALLBACK Win32Window::WndProc(HWND const window,
                                       UINT const message,
                                       WPARAM const wparam,
                                       LPARAM const lparam) noexcept {
+  if (message == WM_GETOBJECT) {
+    return 0;
+  }
   if (message == WM_NCCREATE) {
     auto window_struct = reinterpret_cast<CREATESTRUCT*>(lparam);
     SetWindowLongPtr(window, GWLP_USERDATA,
@@ -179,6 +235,18 @@ Win32Window::MessageHandler(HWND hwnd,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
   switch (message) {
+    case WM_GETOBJECT:
+      return 0;
+
+    case WM_GETMINMAXINFO: {
+      auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+      if (info != nullptr) {
+        info->ptMinTrackSize.x = 640;
+        info->ptMinTrackSize.y = 420;
+      }
+      return 0;
+    }
+
     case WM_DESTROY:
       window_handle_ = nullptr;
       Destroy();
@@ -198,11 +266,15 @@ Win32Window::MessageHandler(HWND hwnd,
       return 0;
     }
     case WM_SIZE: {
+      if (wparam == SIZE_MINIMIZED) {
+        return 0;
+      }
       RECT rect = GetClientArea();
-      if (child_content_ != nullptr) {
-        // Size and position the child window.
-        MoveWindow(child_content_, rect.left, rect.top, rect.right - rect.left,
-                   rect.bottom - rect.top, TRUE);
+      LONG w = rect.right - rect.left;
+      LONG h = rect.bottom - rect.top;
+      if (child_content_ != nullptr && w > 0 && h > 0) {
+        // Size and position the child window safely.
+        MoveWindow(child_content_, rect.left, rect.top, w, h, TRUE);
       }
       return 0;
     }
@@ -240,18 +312,30 @@ Win32Window* Win32Window::GetThisFromHandle(HWND const window) noexcept {
 
 void Win32Window::SetChildContent(HWND content) {
   child_content_ = content;
+  if (content != nullptr) {
+    WNDPROC prev =
+        reinterpret_cast<WNDPROC>(GetWindowLongPtr(content, GWLP_WNDPROC));
+    if (prev != nullptr && prev != SafeChildWndProc) {
+      g_original_child_wndproc = prev;
+      SetWindowLongPtr(content, GWLP_WNDPROC,
+                       reinterpret_cast<LONG_PTR>(SafeChildWndProc));
+    }
+  }
   SetParent(content, window_handle_);
   RECT frame = GetClientArea();
+  LONG w = std::max<LONG>(1, frame.right - frame.left);
+  LONG h = std::max<LONG>(1, frame.bottom - frame.top);
 
-  MoveWindow(content, frame.left, frame.top, frame.right - frame.left,
-             frame.bottom - frame.top, true);
+  MoveWindow(content, frame.left, frame.top, w, h, TRUE);
 
   SetFocus(child_content_);
 }
 
 RECT Win32Window::GetClientArea() {
-  RECT frame;
-  GetClientRect(window_handle_, &frame);
+  RECT frame{};
+  if (window_handle_) {
+    GetClientRect(window_handle_, &frame);
+  }
   return frame;
 }
 

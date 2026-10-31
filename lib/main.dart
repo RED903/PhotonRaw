@@ -46,8 +46,13 @@ class PhotonRawApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PhotonRaw v1.0.4 — Pro RAW & Photo Darkroom',
+      title: 'PhotonRaw v1.0.5 — Pro RAW & Photo Darkroom',
       debugShowCheckedModeBanner: false,
+      // Windows flutter_windows.dll(0x3c1ca) AccessibilityBridge AXTree 크래시 원천 차단을 위해 Semantics 트리 비활성화
+      builder: (context, child) => ExcludeSemantics(
+        excluding: true,
+        child: child ?? const SizedBox.shrink(),
+      ),
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF181818),
         colorScheme: const ColorScheme.dark(
@@ -99,6 +104,88 @@ class _DecodedFileBundle {
     required this.qualityProxy,
     required this.thumbProxy,
   });
+}
+
+/// 최상위(Top-level) 디코딩 함수 — State(this)나 BuildContext/FocusNode가 절대 클로저에 캡처되지 않도록 클래스 외부에 정의
+_DecodedFileBundle _decodeFileBundleTopLevel(String filePath) {
+  final decoded = decodeImageFile(filePath);
+  final qualityProxy = makeProxy(
+    decoded.rgb,
+    decoded.width,
+    decoded.height,
+    1150,
+  );
+  final fastProxy = makeProxy(
+    qualityProxy.rgb,
+    qualityProxy.width,
+    qualityProxy.height,
+    560,
+  );
+  final thumbProxy = makeProxy(
+    fastProxy.rgb,
+    fastProxy.width,
+    fastProxy.height,
+    180,
+  );
+  return _DecodedFileBundle(
+    filePath: filePath,
+    decoded: decoded,
+    fastProxy: fastProxy,
+    qualityProxy: qualityProxy,
+    thumbProxy: thumbProxy,
+  );
+}
+
+/// 최상위 Isolate 실행 래퍼 (클래스 외부에서 호출하여 unsendable 객체 캡처 원천 차단)
+Future<_DecodedFileBundle> _runDecodeFileInIsolate(String filePath) {
+  return Isolate.run<_DecodedFileBundle>(
+    () => _decodeFileBundleTopLevel(filePath),
+  );
+}
+
+/// 내보내기용 순수 데이터 패킷 (Isolate 간 안전한 전달 보장)
+class _ExportIsolateJob {
+  final int width;
+  final int height;
+  final Uint8List rgb;
+  final Map<String, dynamic> paramsMap;
+  final String format;
+  final int quality;
+
+  const _ExportIsolateJob({
+    required this.width,
+    required this.height,
+    required this.rgb,
+    required this.paramsMap,
+    required this.format,
+    required this.quality,
+  });
+}
+
+/// 최상위(Top-level) 전체 해상도 렌더링 및 인코딩 함수
+Uint8List _encodeExportTopLevel(_ExportIsolateJob job) {
+  final fullSrc = ProxyImage(job.width, job.height, job.rgb);
+  final p = PipelineParams.fromMap(job.paramsMap);
+  final fullRendered = renderFull(fullSrc, p);
+  final rgb8 = toRgb8(fullRendered);
+  final outImg = img.Image.fromBytes(
+    width: fullRendered.width,
+    height: fullRendered.height,
+    bytes: rgb8.buffer,
+    numChannels: 3,
+  );
+  if (job.format == 'png') {
+    return Uint8List.fromList(img.encodePng(outImg));
+  } else if (job.format == 'tiff16') {
+    return Uint8List.fromList(img.encodeTiff(outImg));
+  } else {
+    return Uint8List.fromList(img.encodeJpg(outImg, quality: job.quality));
+  }
+}
+
+/// 최상위 내보내기 Isolate 실행 래퍼
+Future<Uint8List> _runExportInIsolate(_ExportIsolateJob job) {
+  return Isolate.run<Uint8List>(() => _encodeExportTopLevel(job));
 }
 
 class _PreviewRenderOutput {
@@ -200,7 +287,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   Timer? _qualityDebounceTimer;
 
   bool _isLoadingFile = false;
-  String _statusMessage = '준비 완료 (v1.0.4) — 사진 또는 RAW 파일을 열어주세요';
+  String _statusMessage = '준비 완료 (v1.0.5) — 사진 또는 RAW 파일을 열어주세요';
 
   // 우측 모듈 필터 및 검색 상태 (SemiDarktable 6개 카테고리 탭과 동일)
   String _activeCategory = 'all'; // 'all', 'active', 'tone', 'color', 'geometry', 'detail'
@@ -336,34 +423,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       }
 
       try {
-        final bundle = await Isolate.run<_DecodedFileBundle>(() {
-          final decoded = decodeImageFile(path);
-          final qualityProxy = makeProxy(
-            decoded.rgb,
-            decoded.width,
-            decoded.height,
-            1150,
-          );
-          final fastProxy = makeProxy(
-            qualityProxy.rgb,
-            qualityProxy.width,
-            qualityProxy.height,
-            560,
-          );
-          final thumbProxy = makeProxy(
-            fastProxy.rgb,
-            fastProxy.width,
-            fastProxy.height,
-            180,
-          );
-          return _DecodedFileBundle(
-            filePath: path,
-            decoded: decoded,
-            fastProxy: fastProxy,
-            qualityProxy: qualityProxy,
-            thumbProxy: thumbProxy,
-          );
-        });
+        final bundle = await _runDecodeFileInIsolate(path);
 
         final thumbRgba = rgbToRgba(bundle.thumbProxy);
         final thumbImg = await _bytesToUiImage(
@@ -1021,31 +1081,17 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
 
     try {
       for (final item in targets) {
-        final fullSrc = ProxyImage(
-          item.fullDecoded.width,
-          item.fullDecoded.height,
-          item.fullDecoded.rgb,
-        );
         final paramsMap = item.params.toMap();
-
-        final encodedBytes = await Isolate.run<Uint8List>(() {
-          final p = PipelineParams.fromMap(paramsMap);
-          final fullRendered = renderFull(fullSrc, p);
-          final rgb8 = toRgb8(fullRendered);
-          final outImg = img.Image.fromBytes(
-            width: fullRendered.width,
-            height: fullRendered.height,
-            bytes: rgb8.buffer,
-            numChannels: 3,
-          );
-          if (format == 'png') {
-            return Uint8List.fromList(img.encodePng(outImg));
-          } else if (format == 'tiff16') {
-            return Uint8List.fromList(img.encodeTiff(outImg));
-          } else {
-            return Uint8List.fromList(img.encodeJpg(outImg, quality: quality));
-          }
-        });
+        final encodedBytes = await _runExportInIsolate(
+          _ExportIsolateJob(
+            width: item.fullDecoded.width,
+            height: item.fullDecoded.height,
+            rgb: item.fullDecoded.rgb,
+            paramsMap: paramsMap,
+            format: format,
+            quality: quality,
+          ),
+        );
 
         final ext = format == 'tiff16' ? 'tif' : format;
         final baseName = item.fileName.replaceAll(RegExp(r'\.[^.]+$'), '');
@@ -1079,10 +1125,17 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
 
   void _showSnack(String msg) {
     if (!mounted) return;
+    final cleanMsg = msg.split('\n').first;
+    ScaffoldMessenger.of(context).clearSnackBars();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(msg, style: const TextStyle(fontSize: 12)),
-        duration: const Duration(seconds: 2),
+        content: Text(
+          cleanMsg,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 12),
+        ),
+        duration: const Duration(seconds: 3),
       ),
     );
   }
@@ -1139,46 +1192,28 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             body: SafeArea(
               child: LayoutBuilder(
                 builder: (context, rootConstraints) {
-                  // 창이 최소화되었거나 극단적으로 작아졌을 때 레이아웃 오버플로우/크래시 방지 가드
-                  if (rootConstraints.maxWidth < 120 ||
-                      rootConstraints.maxHeight < 120) {
-                    return const SizedBox.expand();
-                  }
-
-                  final showBottomBars = rootConstraints.maxHeight >= 220;
+                  // 창 크기 변경 시 위젯 트리 구조(Row/Column)가 교체되지 않도록 고정 구조 유지
+                  final maxW = math.max(320.0, rootConstraints.maxWidth);
                   final inspectorWidth =
-                      (rootConstraints.maxWidth * 0.34).clamp(270.0, 380.0);
+                      (maxW * 0.34).clamp(240.0, 380.0).clamp(160.0, maxW * 0.52);
 
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _buildTopActionToolbar(),
-                      Expanded(
-                        child: rootConstraints.maxWidth < 560
-                            ? Column(
-                                children: [
-                                  Expanded(
-                                    flex: 5,
-                                    child: _buildCenterViewport(),
-                                  ),
-                                  Expanded(
-                                    flex: 6,
-                                    child: _buildRightInspector(),
-                                  ),
-                                ],
-                              )
-                            : Row(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  Expanded(child: _buildCenterViewport()),
-                                  SizedBox(
-                                    width: inspectorWidth,
-                                    child: _buildRightInspector(),
-                                  ),
-                                ],
+                  return ClipRect(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _buildTopActionToolbar(),
+                        Expanded(
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Expanded(child: _buildCenterViewport()),
+                              SizedBox(
+                                width: inspectorWidth,
+                                child: _buildRightInspector(),
                               ),
-                      ),
-                      if (showBottomBars)
+                            ],
+                          ),
+                        ),
                         FilmstripWidget(
                           items: _photos
                               .map(
@@ -1219,8 +1254,9 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                           },
                           onAddFiles: _pickAndLoadFiles,
                         ),
-                      if (showBottomBars) _buildBottomStatusBar(),
-                    ],
+                        _buildBottomStatusBar(),
+                      ],
+                    ),
                   );
                 },
               ),
@@ -1256,7 +1292,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.4',
+                '⚡ PhotonRaw v1.0.5',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -1513,7 +1549,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     );
   }
 
-  /// 우측 다크룸 인스펙터 패널 (창 세로 크기가 작아져도 절대 오버플로우가 나지 않도록 적응형 레이아웃 구성)
+  /// 우측 다크룸 인스펙터 패널 (창 크기 변경 시에도 위젯 트리 구조가 바뀌지 않도록 고정 Column + Visibility 유지)
   Widget _buildRightInspector() {
     return Container(
       decoration: const BoxDecoration(
@@ -1522,124 +1558,105 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       ),
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final headerWidgets = <Widget>[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
-              child: ScopeAnalyzerWidget(scopeData: _scopeData),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: SizedBox(
-                height: 28,
-                child: TextField(
-                  controller: _searchController,
-                  style: const TextStyle(fontSize: 11.5),
-                  decoration: InputDecoration(
-                    hintText: '🔍 모듈 검색 (예: 노출, 커브, 화이트밸런스, 선명도...)',
-                    hintStyle: const TextStyle(
-                      fontSize: 11,
-                      color: Color(0xFF777777),
+          final showScope = constraints.maxHeight >= 310;
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (showScope)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+                  child: ScopeAnalyzerWidget(scopeData: _scopeData),
+                ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                child: SizedBox(
+                  height: 28,
+                  child: TextField(
+                    controller: _searchController,
+                    style: const TextStyle(fontSize: 11.5),
+                    decoration: InputDecoration(
+                      hintText: '🔍 모듈 검색 (예: 노출, 커브, 화이트밸런스, 선명도...)',
+                      hintStyle: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF777777),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      filled: true,
+                      fillColor: const Color(0xFF161616),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(4),
+                        borderSide: const BorderSide(color: Color(0xFF333333)),
+                      ),
+                      suffixIcon: _moduleSearchQuery.isNotEmpty
+                          ? IconButton(
+                              padding: EdgeInsets.zero,
+                              icon: const Icon(Icons.clear, size: 14),
+                              onPressed: () {
+                                _searchController.clear();
+                                setState(() => _moduleSearchQuery = '');
+                              },
+                            )
+                          : null,
                     ),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 4,
-                    ),
-                    filled: true,
-                    fillColor: const Color(0xFF161616),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(4),
-                      borderSide: const BorderSide(color: Color(0xFF333333)),
-                    ),
-                    suffixIcon: _moduleSearchQuery.isNotEmpty
-                        ? IconButton(
-                            padding: EdgeInsets.zero,
-                            icon: const Icon(Icons.clear, size: 14),
-                            onPressed: () {
-                              _searchController.clear();
-                              setState(() => _moduleSearchQuery = '');
-                            },
-                          )
-                        : null,
+                    onChanged: (v) =>
+                        setState(() => _moduleSearchQuery = v.trim()),
                   ),
-                  onChanged: (v) =>
-                      setState(() => _moduleSearchQuery = v.trim()),
                 ),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: SizedBox(
-                height: 25,
-                child: Row(
-                  children: [
-                    for (final tab in [
-                      ('all', '전체'),
-                      ('active', '활성'),
-                      ('tone', '톤/노출'),
-                      ('color', '색상'),
-                      ('geometry', '기하학'),
-                      ('detail', '디테일'),
-                    ])
-                      Expanded(
-                        child: Padding(
-                          padding:
-                              const EdgeInsets.symmetric(horizontal: 1.5),
-                          child: InkWell(
-                            onTap: () =>
-                                setState(() => _activeCategory = tab.$1),
-                            borderRadius: BorderRadius.circular(4),
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: _activeCategory == tab.$1
-                                    ? const Color(0xFFE8A838)
-                                    : const Color(0xFF2B2B2B),
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Center(
-                                child: Text(
-                                  tab.$2,
-                                  style: TextStyle(
-                                    fontSize: 10.5,
-                                    fontWeight: FontWeight.bold,
-                                    color: _activeCategory == tab.$1
-                                        ? const Color(0xFF141414)
-                                        : const Color(0xFFBBBBBB),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                child: SizedBox(
+                  height: 25,
+                  child: Row(
+                    children: [
+                      for (final tab in [
+                        ('all', '전체'),
+                        ('active', '활성'),
+                        ('tone', '톤/노출'),
+                        ('color', '색상'),
+                        ('geometry', '기하학'),
+                        ('detail', '디테일'),
+                      ])
+                        Expanded(
+                          child: Padding(
+                            padding:
+                                const EdgeInsets.symmetric(horizontal: 1.5),
+                            child: InkWell(
+                              onTap: () =>
+                                  setState(() => _activeCategory = tab.$1),
+                              borderRadius: BorderRadius.circular(4),
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  color: _activeCategory == tab.$1
+                                      ? const Color(0xFFE8A838)
+                                      : const Color(0xFF2B2B2B),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Center(
+                                  child: Text(
+                                    tab.$2,
+                                    style: TextStyle(
+                                      fontSize: 10.5,
+                                      fontWeight: FontWeight.bold,
+                                      color: _activeCategory == tab.$1
+                                          ? const Color(0xFF141414)
+                                          : const Color(0xFFBBBBBB),
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
                                   ),
-                                  overflow: TextOverflow.ellipsis,
                                 ),
                               ),
                             ),
                           ),
                         ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-            const Divider(height: 1, color: Color(0xFF333333)),
-          ];
-
-          // 창 높이가 340px 미만으로 줄어들었을 때는 헤더까지 함께 스크롤되도록 처리하여 오버플로우 방지
-          if (constraints.maxHeight < 340) {
-            return ListView(
-              padding: const EdgeInsets.only(bottom: 8),
-              children: [
-                ...headerWidgets,
-                Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: _buildAllModuleCards(),
+                    ],
                   ),
                 ),
-              ],
-            );
-          }
-
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              ...headerWidgets,
+              ),
+              const Divider(height: 1, color: Color(0xFF333333)),
               Expanded(
                 child: ListView(
                   padding: const EdgeInsets.all(8),
