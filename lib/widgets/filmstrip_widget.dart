@@ -1,145 +1,201 @@
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
-import '../services/raw_decoder.dart';
 
-/// 하단 큐 & 필름스트립 (다중 파일 탐색기)
+/// 필름스트립에 표시할 개별 사진 항목 데이터
+class FilmstripItemData {
+  final String filePath;
+  final String fileName;
+  final ui.Image? thumbnail;
+
+  const FilmstripItemData({
+    required this.filePath,
+    required this.fileName,
+    required this.thumbnail,
+  });
+}
+
+/// SemiDarktable의 하단 Filmstrip 바 1:1 이식
+/// - Image.memory에 미인코딩 바이트를 넣어 멈추던 버그를 완전히 제거하고 GPU 텍스처(RawImage)로 즉시 렌더링
+/// - 접기/펼치기 토글, 사진 클릭 전환, 개별 사진 닫기(✕) 버튼 제공
 class FilmstripWidget extends StatelessWidget {
-  final List<RawImageResult> images;
+  final List<FilmstripItemData> items;
   final int currentIndex;
+  final bool collapsed;
+  final VoidCallback onToggleCollapse;
   final ValueChanged<int> onSelect;
-  final ValueChanged<int> onClose;
-  final bool isExpanded;
-  final VoidCallback onToggle;
+  final ValueChanged<int> onRemove;
+  final VoidCallback onAddFiles;
 
   const FilmstripWidget({
     super.key,
-    required this.images,
+    required this.items,
     required this.currentIndex,
+    required this.collapsed,
+    required this.onToggleCollapse,
     required this.onSelect,
-    required this.onClose,
-    required this.isExpanded,
-    required this.onToggle,
+    required this.onRemove,
+    required this.onAddFiles,
   });
 
   @override
   Widget build(BuildContext context) {
     return Container(
       decoration: const BoxDecoration(
-        color: Color(0xFF141414),
-        border: Border(top: BorderSide(color: Color(0xFF282828))),
+        color: Color(0xFF1D1D1D),
+        border: Border(
+          top: BorderSide(color: Color(0xFF333333), width: 1),
+        ),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // 접기/펼치기 헤더 바
+          // 필름스트립 상단 타이틀/접기 바
           InkWell(
-            onTap: onToggle,
+            onTap: onToggleCollapse,
             child: Container(
-              height: 30,
+              height: 24,
               padding: const EdgeInsets.symmetric(horizontal: 12),
-              color: const Color(0xFF181818),
+              color: const Color(0xFF252525),
               child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Icon(
-                    isExpanded ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_up,
-                    size: 18,
-                    color: const Color(0xFFDCA353),
-                  ),
-                  const SizedBox(width: 6),
                   Text(
-                    '🎞️ 큐 (${images.length}장)',
+                    collapsed
+                        ? '▲ 필름스트립 펼치기 (${items.length}장 로드됨)'
+                        : '▼ 필름스트립 접기 (${items.length}장 로드됨)',
                     style: const TextStyle(
-                      fontSize: 12,
+                      fontSize: 11,
                       fontWeight: FontWeight.bold,
-                      color: Color(0xFFDCA353),
+                      color: Color(0xFFBBBBBB),
                     ),
                   ),
-                  const Spacer(),
                   const Text(
-                    '탐색기에서 사진/ARW를 끌어다 놓아 추가할 수 있습니다',
-                    style: TextStyle(fontSize: 10.5, color: Colors.grey),
+                    '단축키: ← / → 사진 전환',
+                    style: TextStyle(fontSize: 10, color: Color(0xFF777777)),
                   ),
                 ],
               ),
             ),
           ),
-
-          // 썸네일 스크롤 리스트
-          if (isExpanded)
+          if (!collapsed)
             SizedBox(
-              height: 85,
-              child: images.isEmpty
-                  ? const Center(
-                      child: Text(
-                        '열린 사진이 없습니다. [사진 열기] 또는 드래그 앤 드롭으로 추가하세요.',
-                        style: TextStyle(fontSize: 12, color: Colors.grey),
+              height: 92,
+              child: items.isEmpty
+                  ? Center(
+                      child: TextButton.icon(
+                        onPressed: onAddFiles,
+                        icon: const Icon(
+                          Icons.add_photo_alternate_outlined,
+                          size: 16,
+                          color: Color(0xFFE8A838),
+                        ),
+                        label: const Text(
+                          '사진 열기 또는 화면에 이미지/RAW 파일을 드래그 앤 드롭하세요',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            color: Color(0xFF999999),
+                          ),
+                        ),
                       ),
                     )
                   : ListView.builder(
                       scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                      itemCount: images.length,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      itemCount: items.length,
                       itemBuilder: (context, idx) {
-                        final item = images[idx];
+                        final item = items[idx];
                         final isSelected = idx == currentIndex;
-
                         return GestureDetector(
                           onTap: () => onSelect(idx),
                           child: Container(
-                            width: 105,
+                            width: 96,
                             margin: const EdgeInsets.only(right: 8),
                             decoration: BoxDecoration(
-                              color: isSelected ? const Color(0xFF262626) : const Color(0xFF1B1B1B),
-                              borderRadius: BorderRadius.circular(4),
+                              color: const Color(0xFF2A2A2A),
+                              borderRadius: BorderRadius.circular(5),
                               border: Border.all(
-                                color: isSelected ? const Color(0xFFDCA353) : const Color(0xFF333333),
+                                color: isSelected
+                                    ? const Color(0xFFE8A838)
+                                    : const Color(0xFF3E3E3E),
                                 width: isSelected ? 2.0 : 1.0,
                               ),
                             ),
                             child: Stack(
                               children: [
                                 Column(
-                                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
                                   children: [
-                                    // 썸네일 프리뷰
                                     Expanded(
                                       child: ClipRRect(
-                                        borderRadius: const BorderRadius.vertical(top: Radius.circular(3)),
-                                        child: Image.memory(
-                                          item.previewImage.getBytes(),
-                                          fit: BoxFit.cover,
-                                          errorBuilder: (_, __, ___) => const Icon(Icons.image, size: 24),
+                                        borderRadius:
+                                            const BorderRadius.vertical(
+                                          top: Radius.circular(3),
                                         ),
+                                        child: item.thumbnail != null
+                                            ? RawImage(
+                                                image: item.thumbnail,
+                                                fit: BoxFit.cover,
+                                              )
+                                            : const Center(
+                                                child: SizedBox(
+                                                  width: 16,
+                                                  height: 16,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                    strokeWidth: 2,
+                                                  ),
+                                                ),
+                                              ),
                                       ),
                                     ),
-                                    // 파일명
                                     Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                                      height: 18,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 4,
+                                      ),
+                                      alignment: Alignment.center,
+                                      color: isSelected
+                                          ? const Color(0xFF3A2E18)
+                                          : const Color(0xFF222222),
                                       child: Text(
-                                        item.filename,
-                                        overflow: TextOverflow.ellipsis,
+                                        item.fileName,
                                         style: TextStyle(
-                                          fontSize: 10,
-                                          color: isSelected ? Colors.white : Colors.grey[400],
-                                          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                          fontSize: 9.5,
+                                          color: isSelected
+                                              ? const Color(0xFFE8A838)
+                                              : const Color(0xFFCCCCCC),
                                         ),
+                                        overflow: TextOverflow.ellipsis,
                                       ),
                                     ),
                                   ],
                                 ),
-
-                                // 삭제 X 버튼
+                                // 개별 닫기(✕) 버튼
                                 Positioned(
                                   top: 2,
                                   right: 2,
-                                  child: GestureDetector(
-                                    onTap: () => onClose(idx),
+                                  child: InkWell(
+                                    onTap: () => onRemove(idx),
                                     child: Container(
-                                      padding: const EdgeInsets.all(2),
+                                      width: 16,
+                                      height: 16,
+                                      alignment: Alignment.center,
                                       decoration: BoxDecoration(
-                                        color: Colors.black.withOpacity(0.6),
-                                        shape: BoxShape.circle,
+                                        color: const Color(0xB3000000),
+                                        borderRadius: BorderRadius.circular(8),
                                       ),
-                                      child: const Icon(Icons.close, size: 12, color: Colors.white70),
+                                      child: const Text(
+                                        '✕',
+                                        style: TextStyle(
+                                          fontSize: 9,
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
                                     ),
                                   ),
                                 ),

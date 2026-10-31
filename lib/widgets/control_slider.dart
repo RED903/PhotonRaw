@@ -1,16 +1,24 @@
 import 'package:flutter/material.dart';
 
-/// 전문 사진 편집용 정밀 컨트롤 슬라이더
-/// 더블 클릭 시 기본값으로 리셋되며, 세밀한 수치 조절을 지원합니다.
-class ControlSlider extends StatelessWidget {
+/// SemiDarktable의 SliderSpinRow 1:1 이식 위젯
+/// - 라벨 + 직접 수치 입력/스핀 박스 + 슬라이더
+/// - scale 지원 (예: scale = 0.01 이면 UI 슬라이더는 -100~+100을 표시하고 내부 파라미터는 -1.0~+1.0 저장)
+/// - 슬라이더나 라벨 더블클릭 시 기본값(defaultVal)으로 즉시 복원
+/// - 슬라이더 조작 시 상위 ModuleCard 자동 활성화(onAutoTurnOn) 지원
+/// - 드래그 시작/종료 시 Undo 히스토리 1단계 저장(onChangeStart / onChangeEnd) 지원
+class ControlSlider extends StatefulWidget {
   final String label;
-  final double value;
-  final double min;
-  final double max;
-  final double defaultValue;
+  final double value; // 내부 실제 파라미터 값 (예: -1.0 ~ 1.0)
+  final double min; // UI 표시 최소값 (예: -100.0)
+  final double max; // UI 표시 최대값 (예: 100.0)
+  final double defaultVal; // UI 표시 기본값 (예: 0.0)
+  final double scale; // UI 값 -> 내부 값 변환 배율 (기본 1.0, 퍼센트형은 0.01)
+  final int decimals;
+  final String suffix;
   final ValueChanged<double> onChanged;
-  final int fractions;
-  final String unit;
+  final VoidCallback? onChangeStart;
+  final VoidCallback? onChangeEnd;
+  final VoidCallback? onAutoTurnOn;
 
   const ControlSlider({
     super.key,
@@ -18,88 +26,211 @@ class ControlSlider extends StatelessWidget {
     required this.value,
     required this.min,
     required this.max,
-    required this.defaultValue,
+    required this.defaultVal,
+    this.scale = 1.0,
+    this.decimals = 2,
+    this.suffix = '',
     required this.onChanged,
-    this.fractions = 2,
-    this.unit = '',
+    this.onChangeStart,
+    this.onChangeEnd,
+    this.onAutoTurnOn,
   });
 
   @override
+  State<ControlSlider> createState() => _ControlSliderState();
+}
+
+class _ControlSliderState extends State<ControlSlider> {
+  bool _isEditingText = false;
+  late TextEditingController _textController;
+
+  double get _uiValue => (widget.value / widget.scale).clamp(widget.min, widget.max);
+
+  @override
+  void initState() {
+    super.initState();
+    _textController = TextEditingController(
+      text: _uiValue.toStringAsFixed(widget.decimals),
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant ControlSlider oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_isEditingText && (oldWidget.value != widget.value || oldWidget.scale != widget.scale)) {
+      _textController.text = _uiValue.toStringAsFixed(widget.decimals);
+    }
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    super.dispose();
+  }
+
+  void _resetToDefault() {
+    widget.onChangeStart?.call();
+    widget.onAutoTurnOn?.call();
+    widget.onChanged(widget.defaultVal * widget.scale);
+    widget.onChangeEnd?.call();
+  }
+
+  void _commitText(String raw) {
+    setState(() => _isEditingText = false);
+    final parsed = double.tryParse(raw.trim());
+    if (parsed != null) {
+      final clampedUi = parsed.clamp(widget.min, widget.max);
+      widget.onChangeStart?.call();
+      widget.onAutoTurnOn?.call();
+      widget.onChanged(clampedUi * widget.scale);
+      widget.onChangeEnd?.call();
+    } else {
+      _textController.text = _uiValue.toStringAsFixed(widget.decimals);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final isModified = (value - defaultValue).abs() > 0.001;
+    final clampedVal = _uiValue;
+    final isModified = (clampedVal - widget.defaultVal).abs() > 1e-4;
 
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2.0, horizontal: 8.0),
+      padding: const EdgeInsets.symmetric(vertical: 2.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              // 라벨 & 더블클릭 초기화 힌트 (유연한 너비 확장)
               Expanded(
                 child: GestureDetector(
-                  onDoubleTap: () => onChanged(defaultValue),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Flexible(
+                  onDoubleTap: _resetToDefault,
+                  child: Tooltip(
+                    message: '더블클릭하여 기본값(${widget.defaultVal.toStringAsFixed(widget.decimals)})으로 초기화',
+                    child: Text(
+                      widget.label,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: isModified
+                            ? const Color(0xFFE0E0E0)
+                            : const Color(0xFFB0B0B0),
+                        fontWeight:
+                            isModified ? FontWeight.w600 : FontWeight.normal,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              _isEditingText
+                  ? SizedBox(
+                      width: 68,
+                      height: 22,
+                      child: TextField(
+                        controller: _textController,
+                        autofocus: true,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          signed: true,
+                          decimal: true,
+                        ),
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.white,
+                          fontFamily: 'monospace',
+                        ),
+                        decoration: InputDecoration(
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 4,
+                            vertical: 2,
+                          ),
+                          filled: true,
+                          fillColor: const Color(0xFF1A1A1A),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(3),
+                            borderSide: const BorderSide(
+                              color: Color(0xFFE8A838),
+                            ),
+                          ),
+                        ),
+                        onSubmitted: _commitText,
+                        onTapOutside: (_) => _commitText(_textController.text),
+                      ),
+                    )
+                  : GestureDetector(
+                      onTap: () {
+                        setState(() {
+                          _isEditingText = true;
+                          _textController.text =
+                              clampedVal.toStringAsFixed(widget.decimals);
+                          _textController.selection = TextSelection(
+                            baseOffset: 0,
+                            extentOffset: _textController.text.length,
+                          );
+                        });
+                      },
+                      onDoubleTap: _resetToDefault,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1E1E1E),
+                          borderRadius: BorderRadius.circular(3),
+                          border: Border.all(
+                            color: isModified
+                                ? const Color(0xFF554422)
+                                : const Color(0xFF333333),
+                          ),
+                        ),
                         child: Text(
-                          label,
-                          overflow: TextOverflow.ellipsis,
+                          '${clampedVal.toStringAsFixed(widget.decimals)}${widget.suffix}',
                           style: TextStyle(
-                            fontSize: 12.0,
-                            fontWeight: isModified ? FontWeight.bold : FontWeight.normal,
-                            color: isModified ? const Color(0xFF64B5F6) : Colors.grey[300],
+                            fontSize: 11,
+                            fontFamily: 'monospace',
+                            color: isModified
+                                ? const Color(0xFFE8A838)
+                                : const Color(0xFFAAAAAA),
                           ),
                         ),
                       ),
-                      if (isModified) ...[
-                        const SizedBox(width: 4),
-                        Container(
-                          width: 4,
-                          height: 4,
-                          decoration: const BoxDecoration(
-                            color: Color(0xFF64B5F6),
-                            shape: BoxShape.circle,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ),
-
-              const SizedBox(width: 8),
-
-              // 수치 표시 (더블클릭 시 리셋)
-              GestureDetector(
-                onDoubleTap: () => onChanged(defaultValue),
-                child: Text(
-                  '${value >= 0 && min < 0 ? '+' : ''}${value.toStringAsFixed(fractions)}$unit',
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    fontFamily: 'monospace',
-                    fontWeight: FontWeight.w600,
-                    color: isModified ? Colors.white : Colors.grey[400],
-                  ),
-                ),
-              ),
+                    ),
             ],
           ),
-          SliderTheme(
-            data: SliderTheme.of(context).copyWith(
-              trackHeight: 2.5,
-              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5.5),
-              overlayShape: const RoundSliderOverlayShape(overlayRadius: 10.0),
-              activeTrackColor: isModified ? const Color(0xFF42A5F5) : Colors.grey[600],
-              inactiveTrackColor: const Color(0xFF2A2A2A),
-              thumbColor: isModified ? const Color(0xFF90CAF9) : Colors.grey[400],
-            ),
-            child: Slider(
-              value: value.clamp(min, max),
-              min: min,
-              max: max,
-              onChanged: onChanged,
+          GestureDetector(
+            onDoubleTap: _resetToDefault,
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 3.0,
+                activeTrackColor: const Color(0xFFE8A838),
+                inactiveTrackColor: const Color(0xFF1A1A1A),
+                thumbColor: isModified
+                    ? const Color(0xFFE8A838)
+                    : const Color(0xFF999999),
+                overlayColor: const Color(0x29E8A838),
+                thumbShape: const RoundSliderThumbShape(
+                  enabledThumbRadius: 6.0,
+                ),
+                overlayShape: const RoundSliderOverlayShape(
+                  overlayRadius: 11.0,
+                ),
+              ),
+              child: Slider(
+                value: clampedVal,
+                min: widget.min,
+                max: widget.max,
+                onChangeStart: (_) {
+                  widget.onChangeStart?.call();
+                  widget.onAutoTurnOn?.call();
+                },
+                onChanged: (uiVal) {
+                  widget.onChanged(uiVal * widget.scale);
+                },
+                onChangeEnd: (_) {
+                  widget.onChangeEnd?.call();
+                },
+              ),
             ),
           ),
         ],

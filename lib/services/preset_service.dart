@@ -1,132 +1,217 @@
+import 'dart:convert';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
 import '../models/pipeline_params.dart';
 
-/// 프리셋 모델
-class Preset {
-  final String id;
-  final String name;
-  final String description;
-  final PipelineParams params;
-
-  const Preset({
-    required this.id,
-    required this.name,
-    required this.description,
-    required this.params,
-  });
-}
-
-/// 내장 프리셋 제공 서비스 (SemiDarktable 정밀 호환)
+/// SemiDarktable의 BUILTIN_PRESETS 및 사용자 프리셋 관리 서비스 1:1 이식
 class PresetService {
-  static List<Preset> getBuiltinPresets() {
-    return [
-      Preset(
-        id: 'reset',
-        name: '🔄 00 Default (기본 초기화)',
-        description: '모든 보정 설정 초기화 / 원본 기본값',
-        params: PipelineParams(),
-      ),
-      Preset(
-        id: 'vivid_landscape',
-        name: '🌲 Vivid Landscape (풍경 비비드)',
-        description: '푸른 하늘과 싱그러운 자연의 생생하고 쨍한 색감',
-        params: PipelineParams()
-          ..exposureEnabled = true
-          ..expEv = 0.0
-          ..blackLevel = 0.02
-          ..contrast = 0.2
-          ..sigmoidEnabled = true
-          ..sigContrast = 1.25
-          ..sigShoulder = 0.15
-          ..sigToe = 0.1
-          ..satVibrance = 0.3
-          ..satGlobal = 0.2
-          ..teHighlights = -0.15
-          ..teShadows = 0.15,
-      ),
-      Preset(
-        id: 'warm_portrait',
-        name: '🌸 Warm Portrait (인물 웜톤)',
-        description: '자연스럽고 화사한 스킨톤 + 부드러운 하이라이트',
-        params: PipelineParams()
-          ..exposureEnabled = true
-          ..expEv = 0.3
-          ..blackLevel = -0.02
-          ..contrast = -0.05
-          ..wbEnabled = true
-          ..wbTemperature = 6600.0
-          ..wbTint = 0.06
-          ..sigmoidEnabled = true
-          ..sigContrast = 1.05
-          ..sigSkew = 0.15
-          ..sigShoulder = 0.35
-          ..sigToe = 0.05
-          ..satVibrance = 0.1
-          ..satGlobal = 0.05
-          ..teHighlights = -0.2
-          ..teShadows = 0.1,
-      ),
-      Preset(
-        id: 'modern_film',
-        name: '🎞️ Modern Film (필름 룩)',
-        description: '부드러운 하이라이트 페이드 + 따뜻한 골드 섀도우',
-        params: PipelineParams()
-          ..exposureEnabled = true
-          ..expEv = 0.15
-          ..blackLevel = 0.05
-          ..contrast = 0.1
-          ..wbEnabled = true
-          ..wbTemperature = 6200.0
-          ..wbTint = 0.04
-          ..sigmoidEnabled = true
-          ..sigContrast = 1.15
-          ..sigSkew = 0.1
-          ..sigShoulder = 0.2
-          ..sigToe = 0.15
-          ..satVibrance = -0.05
-          ..satGlobal = -0.1
-          ..teShadows = 0.2,
-      ),
-      Preset(
-        id: 'cinematic_moody',
-        name: '🎬 Cinematic Moody (시네마틱)',
-        description: '깊은 섀도우 틸/오렌지 색감 + 짙은 시네마 분위기',
-        params: PipelineParams()
-          ..exposureEnabled = true
-          ..expEv = -0.2
-          ..blackLevel = 0.08
-          ..contrast = 0.25
-          ..wbEnabled = true
-          ..wbTemperature = 5800.0
-          ..wbTint = -0.02
-          ..sigmoidEnabled = true
-          ..sigContrast = 1.3
-          ..sigSkew = -0.1
-          ..sigShoulder = 0.1
-          ..sigToe = 0.2
-          ..teHighlights = -0.25
-          ..teShadows = -0.1
-          ..satVibrance = 0.15
-          ..satGlobal = 0.1,
-      ),
-      Preset(
-        id: 'bw_fineart',
-        name: '🖤 B&W Fine Art (흑백 파인아트)',
-        description: '강렬한 대비와 깊은 톤의 클래식 흑백',
-        params: PipelineParams()
-          ..exposureEnabled = true
-          ..expEv = 0.1
-          ..blackLevel = 0.06
-          ..contrast = 0.35
-          ..colorZonesEnabled = true
-          ..satGlobal = -1.0
-          ..satVibrance = 0.0
-          ..sigmoidEnabled = true
-          ..sigContrast = 1.4
-          ..sigShoulder = 0.2
-          ..sigToe = 0.2
-          ..teHighlights = 0.1
-          ..teShadows = -0.15,
-      ),
-    ];
+  /// SemiDarktable main.py의 6개 기본 내장 프리셋과 100% 동일한 정규화 파라미터
+  static final Map<String, Map<String, dynamic>> builtinPresets = {
+    '🔄 Default (초기화)': {},
+    '🌲 Vivid Landscape (풍경)': {
+      'exposure_enabled': true,
+      'exp_ev': 0.2,
+      'exp_contrast': 0.12,
+      'sigmoid_enabled': true,
+      'sig_contrast': 1.45,
+      'tone_equalizer_enabled': true,
+      'te_shadows': 0.35,
+      'te_highlights': -0.35,
+      'color_zones_enabled': true,
+      'sat_global': 0.15,
+      'sat_vibrance': 0.25,
+      'color_equalizer_enabled': true,
+      'ceq_sat': [0.0, 0.10, 0.15, 0.20, 0.15, 0.25, 0.0, 0.0],
+      'ceq_bri': [0.0, 0.0, 0.05, 0.0, -0.10, -0.15, 0.0, 0.0],
+      'dehaze_enabled': true,
+      'dh_strength': 0.20,
+      'local_contrast_enabled': true,
+      'lc_detail': 0.25,
+      'lc_clarity': 0.18,
+      'sharpen_enabled': true,
+      'sh_amount': 0.35,
+    },
+    '🌸 Warm Portrait (인물)': {
+      'exposure_enabled': true,
+      'exp_ev': 0.25,
+      'exp_contrast': -0.06,
+      'wb_enabled': true,
+      'wb_temperature': 5800.0,
+      'wb_tint': 0.04,
+      'tone_equalizer_enabled': true,
+      'te_shadows': 0.25,
+      'te_midtones': 0.1,
+      'te_highlights': -0.2,
+      'color_zones_enabled': true,
+      'sat_global': -0.05,
+      'sat_vibrance': 0.12,
+      'color_equalizer_enabled': true,
+      'ceq_bri': [0.08, 0.12, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05],
+      'ceq_sat': [-0.05, -0.08, 0.0, 0.0, 0.0, 0.0, 0.0, -0.05],
+      'local_contrast_enabled': true,
+      'lc_detail': 0.0,
+      'lc_clarity': -0.08,
+    },
+    '🎞️ Modern Film (필름)': {
+      'exposure_enabled': true,
+      'exp_black_level': -0.025,
+      'exp_contrast': 0.08,
+      'sigmoid_enabled': true,
+      'sig_contrast': 1.35,
+      'sig_toe': 0.18,
+      'sig_shoulder': 0.15,
+      'tone_curve_enabled': true,
+      'tone_curve_points': {
+        'rgb': [
+          [0.0, 0.05],
+          [0.25, 0.22],
+          [0.75, 0.78],
+          [1.0, 0.96],
+        ],
+        'r': [
+          [0.0, 0.0],
+          [1.0, 1.0],
+        ],
+        'g': [
+          [0.0, 0.0],
+          [1.0, 1.0],
+        ],
+        'b': [
+          [0.0, 0.03],
+          [1.0, 0.97],
+        ],
+      },
+      'color_zones_enabled': true,
+      'sat_global': -0.12,
+      'sat_vibrance': 0.15,
+      'grain_enabled': true,
+      'gr_amount': 0.18,
+      'vignette_enabled': true,
+      'vg_amount': -0.35,
+    },
+    '🎬 Cinematic Moody (시네마틱)': {
+      'exposure_enabled': true,
+      'exp_ev': -0.15,
+      'exp_contrast': 0.18,
+      'sigmoid_enabled': true,
+      'sig_contrast': 1.6,
+      'sig_toe': 0.25,
+      'color_balance_enabled': true,
+      'cb_shadows_r': -0.15,
+      'cb_midtones_g': 0.05,
+      'cb_midtones_b': -0.15,
+      'cb_highlights_r': 0.18,
+      'color_zones_enabled': true,
+      'sat_global': -0.20,
+      'sat_vibrance': 0.10,
+      'vignette_enabled': true,
+      'vg_amount': -0.5,
+      'grain_enabled': true,
+      'gr_amount': 0.14,
+    },
+    '🖤 B&W Fine Art (흑백)': {
+      'exposure_enabled': true,
+      'exp_contrast': 0.28,
+      'sigmoid_enabled': true,
+      'sig_contrast': 1.8,
+      'tone_equalizer_enabled': true,
+      'te_blacks': -0.25,
+      'te_shadows': -0.15,
+      'te_highlights': 0.2,
+      'te_whites': 0.15,
+      'color_zones_enabled': true,
+      'sat_global': -1.0,
+      'sat_vibrance': -1.0,
+      'local_contrast_enabled': true,
+      'lc_detail': 0.35,
+      'lc_clarity': 0.30,
+      'grain_enabled': true,
+      'gr_amount': 0.22,
+      'vignette_enabled': true,
+      'vg_amount': -0.45,
+    },
+  };
+
+  /// 프리셋 맵을 현재 파라미터에 적용 (기하학 및 원본 촬영 WB 유지)
+  static PipelineParams applyPresetMap(
+    PipelineParams current,
+    Map<String, dynamic> presetData,
+  ) {
+    final base = PipelineParams();
+    base.wbAsShotTemp = current.wbAsShotTemp;
+    base.wbAsShotTint = current.wbAsShotTint;
+    if (!presetData.containsKey('wb_temperature')) {
+      base.wbTemperature = current.wbAsShotTemp;
+    }
+    if (!presetData.containsKey('wb_tint')) {
+      base.wbTint = current.wbAsShotTint;
+    }
+    base.rotate90 = current.rotate90;
+    base.flipH = current.flipH;
+    base.flipV = current.flipV;
+    base.angle = current.angle;
+    base.cropEnabled = current.cropEnabled;
+    base.cropRect = List<double>.from(current.cropRect);
+
+    final merged = base.toMap();
+    presetData.forEach((k, v) {
+      merged[k] = v;
+    });
+    return PipelineParams.fromMap(merged);
+  }
+
+  static Future<Directory> _getPresetsDir() async {
+    final docDir = await getApplicationSupportDirectory();
+    final dir = Directory('${docDir.path}/presets');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir;
+  }
+
+  static Future<Map<String, Map<String, dynamic>>> loadUserPresets() async {
+    final result = <String, Map<String, dynamic>>{};
+    try {
+      final dir = await _getPresetsDir();
+      final files = dir.listSync().whereType<File>().where(
+        (f) => f.path.toLowerCase().endsWith('.json'),
+      );
+      for (final file in files) {
+        final filename = file.uri.pathSegments.last;
+        final name = filename.substring(0, filename.length - 5);
+        final content = await file.readAsString();
+        final map = jsonDecode(content) as Map<String, dynamic>;
+        result[name] = map;
+      }
+    } catch (_) {}
+    return result;
+  }
+
+  static Future<void> saveUserPreset(String name, PipelineParams params) async {
+    final dir = await _getPresetsDir();
+    final safeName = name.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
+    if (safeName.isEmpty) return;
+    final file = File('${dir.path}/$safeName.json');
+    final map = params.toMap();
+    map.remove('rotate_90');
+    map.remove('flip_h');
+    map.remove('flip_v');
+    map.remove('angle');
+    map.remove('crop_enabled');
+    map.remove('crop_rect');
+    map.remove('split_view_enabled');
+    map.remove('split_position');
+    map.remove('wb_as_shot_temp');
+    map.remove('wb_as_shot_tint');
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(map));
+  }
+
+  static Future<void> deleteUserPreset(String name) async {
+    final dir = await _getPresetsDir();
+    final safeName = name.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
+    final file = File('${dir.path}/$safeName.json');
+    if (await file.exists()) {
+      await file.delete();
+    }
   }
 }

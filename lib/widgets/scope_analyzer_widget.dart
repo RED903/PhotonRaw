@@ -1,63 +1,163 @@
+import 'dart:async';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
-import '../services/pipeline_engine.dart';
+import '../services/scopes.dart';
 
-/// 4대 전문 스코프 모니터 (SemiDarktable 정밀 호환)
-/// 1. 히스토그램 (Histogram)
-/// 2. 웨이브폼 (Waveform Monitor)
-/// 3. RGB 파레이드 (RGB Parade)
-/// 4. 8밴드 컬러 에너지 (8-Band Color Graph)
+/// SemiDarktable의 ScopeWidget 1:1 이식
+/// - 4개 분석 모드 탭: Waveform, Parade, Histogram, 8-Band
+/// - Waveform/Parade/Histogram은 계산된 RGBA 버퍼를 GPU 텍스처(ui.Image)로 변환하여 즉시 렌더링
+/// - 8-Band는 8개 색상 대역의 평균 채도x밝기 에너지를 컬러 막대 그래프로 렌더링
 class ScopeAnalyzerWidget extends StatefulWidget {
-  final ScopeAnalysisResult? scopeData;
+  final ScopeData? scopeData;
 
-  const ScopeAnalyzerWidget({super.key, this.scopeData});
+  const ScopeAnalyzerWidget({
+    super.key,
+    required this.scopeData,
+  });
 
   @override
   State<ScopeAnalyzerWidget> createState() => _ScopeAnalyzerWidgetState();
 }
 
 class _ScopeAnalyzerWidgetState extends State<ScopeAnalyzerWidget> {
-  String _mode = 'histogram'; // 'histogram', 'waveform', 'parade', '8-band'
+  String _mode = 'waveform'; // 'waveform', 'parade', 'histogram', 'bands'
+  ui.Image? _waveformImg;
+  ui.Image? _paradeImg;
+  ui.Image? _histogramImg;
+
+  @override
+  void initState() {
+    super.initState();
+    _rebuildScopeImages();
+  }
+
+  @override
+  void didUpdateWidget(covariant ScopeAnalyzerWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.scopeData != widget.scopeData) {
+      _rebuildScopeImages();
+    }
+  }
+
+  @override
+  void dispose() {
+    _waveformImg?.dispose();
+    _paradeImg?.dispose();
+    _histogramImg?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _rebuildScopeImages() async {
+    final data = widget.scopeData;
+    if (data == null) return;
+
+    final wf = await _rgbaToUiImage(data.waveformRgba, kScopeW, kScopeH);
+    final pr = await _rgbaToUiImage(data.paradeRgba, kScopeW, kScopeH);
+    final hs = await _rgbaToUiImage(data.histogramRgba, kScopeW, kScopeH);
+
+    if (!mounted) {
+      wf.dispose();
+      pr.dispose();
+      hs.dispose();
+      return;
+    }
+    setState(() {
+      _waveformImg?.dispose();
+      _paradeImg?.dispose();
+      _histogramImg?.dispose();
+      _waveformImg = wf;
+      _paradeImg = pr;
+      _histogramImg = hs;
+    });
+  }
+
+  Future<ui.Image> _rgbaToUiImage(
+    dynamic rgbaBytes,
+    int width,
+    int height,
+  ) {
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      rgbaBytes,
+      width,
+      height,
+      ui.PixelFormat.rgba8888,
+      (ui.Image img) => completer.complete(img),
+    );
+    return completer.future;
+  }
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      padding: const EdgeInsets.all(6),
       decoration: BoxDecoration(
-        color: const Color(0xFF141414),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: const Color(0xFF2C2C2C)),
+        color: const Color(0xFF202020),
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: const Color(0xFF343434)),
       ),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // 스코프 모드 선택 헤더 바
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: const BoxDecoration(
-              color: Color(0xFF1B1B1B),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(5)),
-            ),
-            child: Row(
-              children: [
-                _modeButton('histogram', '히스토그램'),
-                const SizedBox(width: 4),
-                _modeButton('waveform', '웨이브폼'),
-                const SizedBox(width: 4),
-                _modeButton('parade', '파레이드'),
-                const SizedBox(width: 4),
-                _modeButton('8-band', '8-밴드'),
-              ],
-            ),
+          // 4개 스코프 모드 전환 버튼
+          Row(
+            children: [
+              for (final m in [
+                ('waveform', 'Waveform'),
+                ('parade', 'Parade'),
+                ('histogram', 'Histogram'),
+                ('bands', '8-Band'),
+              ])
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 2),
+                    child: InkWell(
+                      onTap: () => setState(() => _mode = m.$1),
+                      borderRadius: BorderRadius.circular(3),
+                      child: Container(
+                        height: 22,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: _mode == m.$1
+                              ? const Color(0xFF3E3524)
+                              : const Color(0xFF181818),
+                          borderRadius: BorderRadius.circular(3),
+                          border: Border.all(
+                            color: _mode == m.$1
+                                ? const Color(0xFFE8A838)
+                                : const Color(0xFF333333),
+                          ),
+                        ),
+                        child: Text(
+                          m.$2,
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: _mode == m.$1
+                                ? FontWeight.bold
+                                : FontWeight.normal,
+                            color: _mode == m.$1
+                                ? const Color(0xFFE8A838)
+                                : const Color(0xFF999999),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
           ),
-
-          // 스코프 그래픽 캔버스 (높이 130px)
-          SizedBox(
+          const SizedBox(height: 6),
+          // 스코프 표시 캔버스
+          Container(
             height: 125,
-            width: double.infinity,
-            child: CustomPaint(
-              painter: _ScopePainter(
-                mode: _mode,
-                data: widget.scopeData,
-              ),
+            decoration: BoxDecoration(
+              color: const Color(0xFF121212),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: const Color(0xFF2D2D2D)),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: _buildScopeBody(),
             ),
           ),
         ],
@@ -65,159 +165,159 @@ class _ScopeAnalyzerWidgetState extends State<ScopeAnalyzerWidget> {
     );
   }
 
-  Widget _modeButton(String id, String label) {
-    final isSelected = _mode == id;
-    return GestureDetector(
-      onTap: () => setState(() => _mode = id),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-        decoration: BoxDecoration(
-          color: isSelected ? const Color(0xFF332512) : Colors.transparent,
-          borderRadius: BorderRadius.circular(3),
-          border: isSelected ? Border.all(color: const Color(0xFFDCA353)) : null,
-        ),
+  Widget _buildScopeBody() {
+    if (widget.scopeData == null) {
+      return const Center(
         child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 10.5,
-            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-            color: isSelected ? const Color(0xFFDCA353) : Colors.grey[400],
-          ),
+          '이미지를 불러오면 실시간 파형/히스토그램이 표시됩니다',
+          style: TextStyle(fontSize: 11, color: Color(0xFF666666)),
         ),
-      ),
+      );
+    }
+
+    if (_mode == 'bands') {
+      return CustomPaint(
+        size: const Size(double.infinity, 125),
+        painter: _EightBandPainter(levels: widget.scopeData!.bandLevels),
+      );
+    }
+
+    ui.Image? targetImg;
+    if (_mode == 'waveform') {
+      targetImg = _waveformImg;
+    } else if (_mode == 'parade') {
+      targetImg = _paradeImg;
+    } else {
+      targetImg = _histogramImg;
+    }
+
+    if (targetImg == null) {
+      return const SizedBox.expand();
+    }
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        RawImage(
+          image: targetImg,
+          fit: BoxFit.fill,
+          filterQuality: FilterQuality.low,
+        ),
+        CustomPaint(
+          painter: _ScopeOverlayGridPainter(isParade: _mode == 'parade'),
+        ),
+      ],
     );
   }
 }
 
-class _ScopePainter extends CustomPainter {
-  final String mode;
-  final ScopeAnalysisResult? data;
-
-  _ScopePainter({required this.mode, required this.data});
+class _ScopeOverlayGridPainter extends CustomPainter {
+  final bool isParade;
+  _ScopeOverlayGridPainter({required this.isParade});
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (data == null) return;
-
-    if (mode == 'histogram') {
-      _drawHistogram(canvas, size);
-    } else if (mode == 'waveform') {
-      _drawWaveform(canvas, size);
-    } else if (mode == 'parade') {
-      _drawParade(canvas, size);
-    } else if (mode == '8-band') {
-      _draw8Band(canvas, size);
+    final p = Paint()
+      ..color = const Color(0x28FFFFFF)
+      ..strokeWidth = 0.8;
+    for (int i = 1; i < 4; i++) {
+      final y = size.height * (i / 4.0);
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), p);
     }
-  }
-
-  void _drawHistogram(Canvas canvas, Size size) {
-    final binsR = data!.rBins;
-    final binsG = data!.gBins;
-    final binsB = data!.bBins;
-    final binsL = data!.lumaBins;
-    final maxVal = data!.maxBinValue.toDouble();
-    if (maxVal <= 0) return;
-
-    final stepX = size.width / 256.0;
-
-    void drawCurve(List<int> bins, Color col, {bool fill = true}) {
-      final path = Path();
-      path.moveTo(0, size.height);
-      for (int i = 0; i < 256; i++) {
-        final x = i * stepX;
-        final y = size.height - (bins[i] / maxVal * size.height * 0.95);
-        path.lineTo(x, y);
+    if (isParade) {
+      for (int i = 1; i < 3; i++) {
+        final x = size.width * (i / 3.0);
+        canvas.drawLine(Offset(x, 0), Offset(x, size.height), p);
       }
-      if (fill) {
-        path.lineTo(size.width, size.height);
-        path.close();
-        canvas.drawPath(path, Paint()..color = col..style = PaintingStyle.fill);
-      } else {
-        canvas.drawPath(path, Paint()..color = col..style = PaintingStyle.stroke..strokeWidth = 1.0);
-      }
-    }
-
-    drawCurve(binsR, const Color(0x66FF3B30));
-    drawCurve(binsG, const Color(0x6634C759));
-    drawCurve(binsB, const Color(0x66007AFF));
-    drawCurve(binsL, const Color(0x99FFFFFF), fill: false);
-  }
-
-  void _drawWaveform(Canvas canvas, Size size) {
-    final points = data!.waveformPoints;
-    if (points.isEmpty) return;
-
-    final paint = Paint()
-      ..color = const Color(0x334CD964)
-      ..strokeWidth = 1.0;
-
-    for (int i = 0; i < points.length; i += 2) {
-      final nx = points[i];
-      final ny = points[i + 1];
-      canvas.drawCircle(Offset(nx * size.width, (1.0 - ny) * size.height), 0.7, paint);
-    }
-  }
-
-  void _drawParade(Canvas canvas, Size size) {
-    final points = data!.waveformPoints;
-    if (points.isEmpty) return;
-
-    final segW = size.width / 3.0;
-    final pR = Paint()..color = const Color(0x55FF3B30)..strokeWidth = 1.0;
-    final pG = Paint()..color = const Color(0x5534C759)..strokeWidth = 1.0;
-    final pB = Paint()..color = const Color(0x55007AFF)..strokeWidth = 1.0;
-
-    for (int i = 0; i < points.length; i += 2) {
-      final nx = points[i];
-      final ny = points[i + 1];
-      final y = (1.0 - ny) * size.height;
-
-      canvas.drawCircle(Offset(nx * segW, y), 0.7, pR);
-      canvas.drawCircle(Offset(segW + nx * segW, y), 0.7, pG);
-      canvas.drawCircle(Offset(segW * 2 + nx * segW, y), 0.7, pB);
-    }
-  }
-
-  void _draw8Band(Canvas canvas, Size size) {
-    final levels = data!.eightBandLevels;
-    final names = ['R', 'O', 'Y', 'G', 'C', 'B', 'P', 'M'];
-    final colors = [
-      const Color(0xFFFF3B30),
-      const Color(0xFFFF9500),
-      const Color(0xFFFFCC00),
-      const Color(0xFF34C759),
-      const Color(0xFF00C7BE),
-      const Color(0xFF007AFF),
-      const Color(0xFF5856D6),
-      const Color(0xFFAF52DE),
-    ];
-
-    final colW = size.width / 8.0;
-    final chartH = size.height - 20;
-
-    for (int i = 0; i < 8; i++) {
-      final x = i * colW + 4;
-      final w = colW - 8;
-      final val = (i < levels.length ? levels[i] : 0.0).clamp(0.0, 1.0);
-      final barH = val * chartH;
-      final y = chartH - barH;
-
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(Rect.fromLTWH(x, y, w, barH), const Radius.circular(2)),
-        Paint()..color = colors[i],
-      );
-
-      final tp = TextPainter(
-        text: TextSpan(
-          text: names[i],
-          style: TextStyle(color: colors[i], fontSize: 10, fontWeight: FontWeight.bold),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout();
-      tp.paint(canvas, Offset(x + (w - tp.width) / 2, chartH + 3));
     }
   }
 
   @override
-  bool shouldRepaint(covariant _ScopePainter oldDelegate) => true;
+  bool shouldRepaint(covariant _ScopeOverlayGridPainter oldDelegate) =>
+      oldDelegate.isParade != isParade;
+}
+
+class _EightBandPainter extends CustomPainter {
+  final List<double> levels;
+  _EightBandPainter({required this.levels});
+
+  static const List<String> _names = [
+    'Red',
+    'Org',
+    'Yel',
+    'Grn',
+    'Aqu',
+    'Blu',
+    'Pur',
+    'Mag',
+  ];
+
+  static const List<Color> _colors = [
+    Color(0xFFFF4040),
+    Color(0xFFFF8830),
+    Color(0xFFFFDD30),
+    Color(0xFF45DD45),
+    Color(0xFF30DDDD),
+    Color(0xFF4588FF),
+    Color(0xFF9955FF),
+    Color(0xFFFF45CC),
+  ];
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const padX = 12.0;
+    const padTop = 14.0;
+    const padBot = 20.0;
+    final usableW = (size.width - padX * 2).clamp(1.0, 10000.0);
+    final usableH = (size.height - padTop - padBot).clamp(1.0, 10000.0);
+    final slotW = usableW / 8.0;
+    final barW = slotW * 0.58;
+
+    for (int i = 0; i < 8; i++) {
+      final lv = (i < levels.length ? levels[i] : 0.0).clamp(0.0, 1.0);
+      final bh = lv * usableH;
+      final cx = padX + slotW * (i + 0.5);
+      final left = cx - barW * 0.5;
+      final top = padTop + usableH - bh;
+
+      final barRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(left, top, barW, bh),
+        const Radius.circular(3),
+      );
+      canvas.drawRRect(
+        barRect,
+        Paint()..color = _colors[i].withValues(alpha: 0.85),
+      );
+
+      // 퍼센트 수치
+      final pctTp = TextPainter(
+        text: TextSpan(
+          text: '${(lv * 100).round()}%',
+          style: const TextStyle(fontSize: 8.5, color: Color(0xFFCCCCCC)),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      pctTp.paint(canvas, Offset(cx - pctTp.width * 0.5, top - 11));
+
+      // 밴드 라벨
+      final lblTp = TextPainter(
+        text: TextSpan(
+          text: _names[i],
+          style: TextStyle(
+            fontSize: 9,
+            fontWeight: FontWeight.bold,
+            color: _colors[i],
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      lblTp.paint(
+        canvas,
+        Offset(cx - lblTp.width * 0.5, size.height - padBot + 4),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _EightBandPainter oldDelegate) => true;
 }
