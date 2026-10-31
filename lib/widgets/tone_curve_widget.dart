@@ -28,9 +28,13 @@ class ToneCurveWidget extends StatefulWidget {
   State<ToneCurveWidget> createState() => _ToneCurveWidgetState();
 }
 
-class _ToneCurveWidgetState extends State<ToneCurveWidget> {
+class _ToneCurveWidgetState extends State<ToneCurveWidget>
+    with AutomaticKeepAliveClientMixin {
   String _activeChannel = 'rgb';
   int? _draggingIndex;
+
+  @override
+  bool get wantKeepAlive => true;
 
   List<List<double>> get _currentPoints {
     final pts = widget.curvePoints[_activeChannel];
@@ -176,6 +180,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [

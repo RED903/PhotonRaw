@@ -96,13 +96,39 @@ void main() {
     expect(lut.last, closeTo(1.0, 1e-3));
   });
 
-  testWidgets('PhotonRaw v1.0.5 상단 툴바 단일 행 레이아웃 및 창 크기 조절 스트레스 테스트', (
+  testWidgets('PhotonRaw v1.0.6 모듈 기본 닫힘·스크롤 상태 유지·8밴드 Hue 시작 및 창 크기 조절 검증', (
     WidgetTester tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(1440, 900));
     await tester.pumpWidget(const PhotonRawApp());
-    expect(find.text('⚡ PhotonRaw v1.0.5'), findsOneWidget);
+    expect(find.text('⚡ PhotonRaw v1.0.6'), findsOneWidget);
     expect(find.text('사진 또는 RAW 파일을 불러오세요'), findsOneWidget);
+
+    // 1. 처음 실행 시 모든 모듈(노출, 채도 등)이 닫혀 있는지 확인
+    expect(find.text('☀️ 노출 (Exposure)'), findsOneWidget);
+    expect(find.text('노출 (Exposure EV)'), findsNothing);
+
+    // 2. 노출 모듈을 클릭하여 열면 열리고, 스크롤을 내렸다 올려도 열린 상태가 유지되는지 검증
+    await tester.tap(find.text('☀️ 노출 (Exposure)'));
+    await tester.pump();
+    expect(find.text('노출 (Exposure EV)'), findsOneWidget);
+
+    // 3. 8-Band 컬러 이퀄라이저를 스크롤하여 화면에 보이게 한 뒤 열었을 때 기본 탭이 '🎨 Hue (색조)'에서 시작하는지 검증
+    await tester.ensureVisible(find.text('🌈 8-Band 컬러 이퀄라이저 (HSL)'));
+    await tester.pump();
+    await tester.tap(find.text('🌈 8-Band 컬러 이퀄라이저 (HSL)'));
+    await tester.pump();
+    expect(find.text('🎨 Hue (색조)'), findsOneWidget);
+    expect(find.text('✨ Saturation (채도)'), findsOneWidget);
+    expect(find.text('💡 Brightness (밝기)'), findsOneWidget);
+
+    // 4. 스크롤을 아래로 끝까지 내렸다가 다시 위로 올렸을 때 아까 열어둔 노출 모듈과 8-Band 이퀄라이저가 여전히 열려 있는지 검증
+    await tester.drag(find.byType(ListView).last, const Offset(0, -600));
+    await tester.pumpAndSettle();
+    await tester.drag(find.byType(ListView).last, const Offset(0, 600));
+    await tester.pumpAndSettle();
+    expect(find.text('노출 (Exposure EV)'), findsOneWidget);
+    expect(find.text('🎨 Hue (색조)'), findsOneWidget);
 
     // 상단 '📂 파일 열기' 버튼이 화면 전체 가로 폭(1440)으로 늘어나지 않고 정상 크기(< 200px)인지 검증
     final openBtnSize = tester.getSize(find.text('📂 파일 열기'));
@@ -121,6 +147,9 @@ void main() {
       await tester.pump();
       expect(tester.takeException(), isNull);
     }
+
+    // 리사이즈 후에도 열어놓은 노출 모듈이 그대로 열려 있는지 확인
+    expect(find.text('노출 (Exposure EV)'), findsOneWidget);
 
     await tester.binding.setSurfaceSize(null);
   });

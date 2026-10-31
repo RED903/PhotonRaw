@@ -1,14 +1,16 @@
 import 'package:flutter/material.dart';
 
 /// SemiDarktable의 ModuleCard 1:1 이식 위젯
-/// - 전원 토글 버튼 (⏻, 활성화 시 초록색 #66cc66 강조)
-/// - 아코디언 접기/펼치기 (▼ / ▶)
+/// - 전원 토글 버튼 (⏻, 활성화 시 초록색 강조)
+/// - 아코디언 접기/펼치기 (▼ / ▶) — 스크롤을 내렸다 올려도 열림/닫힘 상태가 절대 초기화되지 않도록 KeepAlive 및 상위 상태 연동 지원
 /// - 모듈 개별 초기화 버튼 (↺)
 class ModuleCard extends StatefulWidget {
   final String title;
   final String category;
   final bool enabled;
   final bool initiallyExpanded;
+  final bool? expanded;
+  final ValueChanged<bool>? onExpansionChanged;
   final ValueChanged<bool> onToggleEnabled;
   final VoidCallback onReset;
   final List<Widget> children;
@@ -19,6 +21,8 @@ class ModuleCard extends StatefulWidget {
     required this.category,
     required this.enabled,
     this.initiallyExpanded = false,
+    this.expanded,
+    this.onExpansionChanged,
     required this.onToggleEnabled,
     required this.onReset,
     required this.children,
@@ -28,17 +32,41 @@ class ModuleCard extends StatefulWidget {
   State<ModuleCard> createState() => _ModuleCardState();
 }
 
-class _ModuleCardState extends State<ModuleCard> {
-  late bool _expanded;
+class _ModuleCardState extends State<ModuleCard>
+    with AutomaticKeepAliveClientMixin {
+  late bool _internalExpanded;
+
+  @override
+  bool get wantKeepAlive => true;
+
+  bool get _isExpanded => widget.expanded ?? _internalExpanded;
 
   @override
   void initState() {
     super.initState();
-    _expanded = widget.initiallyExpanded;
+    _internalExpanded = widget.expanded ?? widget.initiallyExpanded;
+  }
+
+  @override
+  void didUpdateWidget(covariant ModuleCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.expanded != null && widget.expanded != _internalExpanded) {
+      _internalExpanded = widget.expanded!;
+    }
+  }
+
+  void _toggleExpand() {
+    final next = !_isExpanded;
+    setState(() {
+      _internalExpanded = next;
+    });
+    widget.onExpansionChanged?.call(next);
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
+    final expanded = _isExpanded;
     final borderColor = widget.enabled
         ? const Color(0xFF4A6B4A)
         : const Color(0xFF363636);
@@ -54,7 +82,7 @@ class _ModuleCardState extends State<ModuleCard> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           // 헤더 영역
-           Container(
+          Container(
             height: 32,
             padding: const EdgeInsets.symmetric(horizontal: 6),
             decoration: BoxDecoration(
@@ -63,7 +91,7 @@ class _ModuleCardState extends State<ModuleCard> {
                   : const Color(0xFF2B2B2B),
               borderRadius: BorderRadius.vertical(
                 top: const Radius.circular(4),
-                bottom: Radius.circular(_expanded ? 0 : 4),
+                bottom: Radius.circular(expanded ? 0 : 4),
               ),
             ),
             child: Row(
@@ -103,11 +131,11 @@ class _ModuleCardState extends State<ModuleCard> {
                 // 모듈 제목 + 아코디언 토글
                 Expanded(
                   child: InkWell(
-                    onTap: () => setState(() => _expanded = !_expanded),
+                    onTap: _toggleExpand,
                     child: Row(
                       children: [
                         Text(
-                          _expanded ? '▼ ' : '▶ ',
+                          expanded ? '▼ ' : '▶ ',
                           style: const TextStyle(
                             fontSize: 10,
                             color: Color(0xFF999999),
@@ -155,7 +183,7 @@ class _ModuleCardState extends State<ModuleCard> {
             ),
           ),
           // 본문 영역
-          if (_expanded)
+          if (expanded)
             Padding(
               padding: const EdgeInsets.fromLTRB(10, 6, 10, 8),
               child: Column(

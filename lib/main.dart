@@ -46,7 +46,7 @@ class PhotonRawApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PhotonRaw v1.0.5 — Pro RAW & Photo Darkroom',
+      title: 'PhotonRaw v1.0.6 — Pro RAW & Photo Darkroom',
       debugShowCheckedModeBanner: false,
       // Windows flutter_windows.dll(0x3c1ca) AccessibilityBridge AXTree 크래시 원천 차단을 위해 Semantics 트리 비활성화
       builder: (context, child) => ExcludeSemantics(
@@ -287,12 +287,18 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   Timer? _qualityDebounceTimer;
 
   bool _isLoadingFile = false;
-  String _statusMessage = '준비 완료 (v1.0.5) — 사진 또는 RAW 파일을 열어주세요';
+  String _statusMessage = '준비 완료 (v1.0.6) — 사진 또는 RAW 파일을 열어주세요';
 
   // 우측 모듈 필터 및 검색 상태 (SemiDarktable 6개 카테고리 탭과 동일)
   String _activeCategory = 'all'; // 'all', 'active', 'tone', 'color', 'geometry', 'detail'
   String _moduleSearchQuery = '';
   final TextEditingController _searchController = TextEditingController();
+  final ScrollController _moduleScrollController = ScrollController();
+
+  // 각 모듈의 아코디언 열림/닫힘 상태 영구 보관 (처음에는 모두 닫혀 있고, 사용자가 열어놓은 모듈만 열려 있도록 유지)
+  final Set<String> _expandedModules = {};
+  // 8밴드 컬러 이퀄라이저 기본 시작 모드 ('hue': 색조, 'sat': 채도, 'bri': 밝기)
+  String _ceqMode = 'hue';
 
   // 뷰포트 인터랙션 모드 상태
   bool _showGrid = false;
@@ -328,6 +334,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   void dispose() {
     _qualityDebounceTimer?.cancel();
     _searchController.dispose();
+    _moduleScrollController.dispose();
     _safeDisposeImage(_processedUiImage);
     _safeDisposeImage(_beforeUiImage);
     for (final p in _photos) {
@@ -1292,7 +1299,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.5',
+                '⚡ PhotonRaw v1.0.6',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -1659,6 +1666,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               const Divider(height: 1, color: Color(0xFF333333)),
               Expanded(
                 child: ListView(
+                  controller: _moduleScrollController,
                   padding: const EdgeInsets.all(8),
                   children: _buildAllModuleCards(),
                 ),
@@ -1667,6 +1675,38 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           );
         },
       ),
+    );
+  }
+
+  /// 모든 모듈 카드가 처음에는 닫혀 있고, 사용자가 열어놓은 모듈만 스크롤/리렌더링 후에도 계속 열려 있도록 상태 연동
+  Widget _buildCard({
+    required String title,
+    required String category,
+    required bool enabled,
+    bool initiallyExpanded = false,
+    required ValueChanged<bool> onToggleEnabled,
+    required VoidCallback onReset,
+    required List<Widget> children,
+  }) {
+    final isExpanded = _expandedModules.contains(title);
+    return ModuleCard(
+      key: ValueKey('module_card_$title'),
+      title: title,
+      category: category,
+      enabled: enabled,
+      expanded: isExpanded,
+      onExpansionChanged: (exp) {
+        setState(() {
+          if (exp) {
+            _expandedModules.add(title);
+          } else {
+            _expandedModules.remove(title);
+          }
+        });
+      },
+      onToggleEnabled: onToggleEnabled,
+      onReset: onReset,
+      children: children,
     );
   }
 
@@ -1686,7 +1726,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: geoActive,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '📐 기하학 & 자르기 (Geometry & Crop)',
           category: 'geometry',
           enabled: geoActive,
@@ -1919,7 +1959,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.exposureEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '☀️ 노출 (Exposure)',
           category: 'tone',
           enabled: p.exposureEnabled,
@@ -1995,7 +2035,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.sigmoidEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '📈 시그모이드 톤 매핑 (Sigmoid)',
           category: 'tone',
           enabled: p.sigmoidEnabled,
@@ -2098,7 +2138,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.toneEqualizerEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🎚️ 톤 이퀄라이저 (Tone Equalizer)',
           category: 'tone',
           enabled: p.toneEqualizerEnabled,
@@ -2201,7 +2241,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.toneCurveEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '📐 톤 커브 (Tone Curve)',
           category: 'tone',
           enabled: p.toneCurveEnabled,
@@ -2247,7 +2287,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.highlightEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '✨ 하이라이트 복원 (Highlight Recovery)',
           category: 'tone',
           enabled: p.highlightEnabled,
@@ -2307,7 +2347,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.dehazeEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🌫️ 안개 제거 (Dehaze)',
           category: 'tone',
           enabled: p.dehazeEnabled,
@@ -2352,7 +2392,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.wbEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🌡️ 화이트 밸런스 (White Balance)',
           category: 'color',
           enabled: p.wbEnabled,
@@ -2439,7 +2479,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.colorZonesEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🎨 채도 & 바이브런스 (Color Zones)',
           category: 'color',
           enabled: p.colorZonesEnabled,
@@ -2498,7 +2538,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.colorEqualizerEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🌈 8-Band 컬러 이퀄라이저 (HSL)',
           category: 'color',
           enabled: p.colorEqualizerEnabled,
@@ -2523,6 +2563,8 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               hue: p.ceqHue,
               sat: p.ceqSat,
               bri: p.ceqBri,
+              mode: _ceqMode,
+              onModeChanged: (m) => setState(() => _ceqMode = m),
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.colorEqualizerEnabled = true,
               onChanged: (h, s, b) => _updateParams((params) {
@@ -2544,7 +2586,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.colorBalanceEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '⚖️ 컬러 밸런스 RGB (3-Way Grading)',
           category: 'color',
           enabled: p.colorBalanceEnabled,
@@ -2634,7 +2676,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.sharpenEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🔪 선명도 (Sharpen)',
           category: 'detail',
           enabled: p.sharpenEnabled,
@@ -2678,7 +2720,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.localContrastEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🔍 로컬 콘트라스트 & 클래리티',
           category: 'detail',
           enabled: p.localContrastEnabled,
@@ -2736,7 +2778,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.denoiseEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🧹 노이즈 감소 (Denoise)',
           category: 'detail',
           enabled: p.denoiseEnabled,
@@ -2781,7 +2823,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.defringeEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🔮 색수차 제거 (Defringe)',
           category: 'detail',
           enabled: p.defringeEnabled,
@@ -2841,7 +2883,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.spotEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🩹 잡티 제거 (Spot Removal)',
           category: 'detail',
           enabled: p.spotEnabled,
@@ -2923,7 +2965,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.blurEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '💧 블러 (Blur)',
           category: 'detail',
           enabled: p.blurEnabled,
@@ -2968,7 +3010,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.grainEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '🎞️ 필름 그레인 (Film Grain)',
           category: 'detail',
           enabled: p.grainEnabled,
@@ -3012,7 +3054,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       enabled: p.vignetteEnabled,
     )) {
       cards.add(
-        ModuleCard(
+        _buildCard(
           title: '⭕ 비네팅 (Vignette)',
           category: 'detail',
           enabled: p.vignetteEnabled,
