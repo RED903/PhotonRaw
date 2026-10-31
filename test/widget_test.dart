@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -5,6 +6,7 @@ import 'package:photon_raw/main.dart';
 import 'package:photon_raw/models/pipeline_params.dart';
 import 'package:photon_raw/services/curve_lut.dart';
 import 'package:photon_raw/services/pipeline_core.dart';
+import 'package:photon_raw/services/raw_decoder.dart';
 import 'package:photon_raw/services/scopes.dart';
 
 void main() {
@@ -96,13 +98,44 @@ void main() {
     expect(lut.last, closeTo(1.0, 1e-3));
   });
 
-  testWidgets('PhotonRaw v1.0.7 모바일 세로 비율(1:1.7 이상) 레이아웃·기하학/크롭 분리·파형 접기/열기 검증', (
+  test('14/16-bit 센서 RAW 직접 디코딩 및 8-bit 내장 JPEG 대체 로드 차단 검증', () {
+    // 1. 14/16-bit 센서 데이터가 없는 가짜/손상된 .arw 파일은 절대 8비트로 불러오지 않고 즉시 예외를 던지는지 검증
+    final tempDir = Directory.systemTemp.createTempSync('photon_raw_test_');
+    final fakeArw = File('${tempDir.path}/fake_8bit_only.arw');
+    // JPEG SOI 시그니처만 넣은 더미 바이트
+    fakeArw.writeAsBytesSync([0xFF, 0xD8, 0xFF, 0xE0, 0, 16, 0x4A, 0x46, 0x49, 0x46]);
+    expect(
+      () => decodeImageFile(fakeArw.path),
+      throwsA(isA<Exception>()),
+    );
+    tempDir.deleteSync(recursive: true);
+
+    // 2. 로컬에 Sony ARW 샘플이 존재하면 14-bit 센서 RAW (32-bit Float linearRgb 포함)로 정상 디코딩되는지 검증
+    const sampleArwPath = r'G:\카메라\저장\50510\7M405642.ARW';
+    if (File(sampleArwPath).existsSync()) {
+      final decoded = decodeImageFile(sampleArwPath);
+      expect(decoded.isRaw, isTrue);
+      expect(decoded.bitDepth, greaterThanOrEqualTo(12));
+      expect(decoded.linearRgb, isNotNull);
+      expect(decoded.linearRgb!.length, decoded.width * decoded.height * 3);
+      expect(decoded.note.contains('센서 RAW'), isTrue);
+    }
+  });
+
+  testWidgets('PhotonRaw v1.0.8 모바일 키보드 포커스 유지·모바일 검색창 숨김·툴바 정리·프리셋 관리 삭제 검증', (
     WidgetTester tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(1440, 900));
     await tester.pumpWidget(const PhotonRawApp());
-    expect(find.text('⚡ PhotonRaw v1.0.7'), findsOneWidget);
+    expect(find.text('⚡ PhotonRaw v1.0.8'), findsOneWidget);
     expect(find.text('사진 또는 RAW 파일을 불러오세요'), findsOneWidget);
+
+    // 0. 상단 바에서 '📋 복사', '📌 붙여넣기', '📌 전체 적용' 및 외부 프리셋 드롭다운이 제거되고 '⚙️ 프리셋 관리'와 '🌐 격자 표시'가 상단에 있는지 검증
+    expect(find.text('📋 복사'), findsNothing);
+    expect(find.text('📌 붙여넣기'), findsNothing);
+    expect(find.text('📌 전체 적용'), findsNothing);
+    expect(find.text('⚙️ 프리셋 관리'), findsOneWidget);
+    expect(find.text('🌐 격자 표시'), findsOneWidget);
 
     // 1. 기하학 모듈이 '📐 회전 & 기울기 (Rotation & Tilt)'와 '✂️ 크롭 / 자르기 (Crop)' 2개로 분리되었는지 확인
     expect(find.text('📐 회전 & 기울기 (Rotation & Tilt)'), findsOneWidget);
@@ -141,10 +174,14 @@ void main() {
     final openBtnSize = tester.getSize(find.text('📂 파일 열기'));
     expect(openBtnSize.width, lessThan(200.0));
 
-    // 6. 모바일 세로 비율(1:1.7 이상, 예: 400 x 840)에서 상단 이미지 -> 중앙 조절창 -> 하단 필름스트립 배치 및 파형 열기/닫기 검증
+    // 6. 모바일 세로 비율(1:1.7 이상, 예: 400 x 840)에서 모듈 검색창이 숨겨지고 파형 열기/닫기가 작동하는지 검증
     await tester.binding.setSurfaceSize(const Size(400, 840));
     await tester.pump();
     expect(tester.takeException(), isNull);
+    expect(
+      find.text('🔍 모듈 검색 (예: 노출, 커브, 화이트밸런스, 선명도...)'),
+      findsNothing,
+    );
     expect(find.text('▶ 파형 열기'), findsOneWidget);
     await tester.tap(find.text('▶ 파형 열기'));
     await tester.pump();

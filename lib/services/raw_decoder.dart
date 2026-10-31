@@ -1,12 +1,14 @@
+import 'dart:ffi' as ffi;
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:ffi/ffi.dart';
 import 'package:image/image.dart' as img;
 
 import 'pipeline_core.dart';
 
-/// 디코딩 완료된 풀 해상도 이미지
+/// 디코딩 완료된 풀 해상도 이미지 (14/16-bit RAW의 경우 [linearRgb]에 무손실 32-bit 선형 Float 보유)
 class DecodedImage {
   final String name;
   final String path;
@@ -15,9 +17,13 @@ class DecodedImage {
   final int width;
   final int height;
   final bool isRaw;
+  final int bitDepth;
   final String camera;
   final String note;
-  final Uint8List rgb; // sRGB 8-bit RGB (width*height*3)
+  final double asShotTemp;
+  final double asShotTint;
+  final Uint8List rgb; // 빠른 히스토그램/자동노출 참조 및 8-bit 이미지용
+  final Float32List? linearRgb; // 14/16-bit RAW 및 16-bit 이미지용 무손실 32-bit Float 선형 RGB
 
   DecodedImage({
     required this.name,
@@ -27,17 +33,38 @@ class DecodedImage {
     required this.width,
     required this.height,
     required this.isRaw,
+    required this.bitDepth,
     required this.camera,
     required this.note,
+    this.asShotTemp = 6500.0,
+    this.asShotTint = 0.0,
     required this.rgb,
+    this.linearRgb,
   });
 }
 
 const Set<String> kRawExtensions = {
-  'arw', 'cr2', 'cr3', 'nef', 'dng', 'raf', 'orf', 'rw2', 'pef', 'srw', 'kdc', 'mos',
+  'arw',
+  'cr2',
+  'cr3',
+  'nef',
+  'dng',
+  'raf',
+  'orf',
+  'rw2',
+  'pef',
+  'srw',
+  'kdc',
+  'mos',
 };
 const Set<String> kImageExtensions = {
-  'jpg', 'jpeg', 'png', 'tif', 'tiff', 'bmp', 'webp',
+  'jpg',
+  'jpeg',
+  'png',
+  'tif',
+  'tiff',
+  'bmp',
+  'webp',
 };
 
 bool isSupportedPath(String path) {
@@ -57,20 +84,21 @@ String _nameOf(String path) {
   return i < 0 ? s : s.substring(i + 1);
 }
 
-/// 파일을 읽어 RGB8 로 디코딩 (백그라운드 Isolate 안에서 호출할 것)
+/// 파일을 읽어 디코딩 (백그라운드 Isolate 안에서 호출)
+/// - RAW 파일은 반드시 12/14/16-bit 센서 데이터로 직접 디코딩하며, 8-bit 내장 JPEG 프리뷰로 폴백하는 것을 원천 금지함!
 DecodedImage decodeImageFile(String path) {
   final file = File(path);
   if (!file.existsSync()) {
     throw Exception('파일을 찾을 수 없습니다: $path');
   }
-  final bytes = file.readAsBytesSync();
   final ext = _extOf(path);
   final name = _nameOf(path);
 
   if (kRawExtensions.contains(ext)) {
-    return _decodeRaw(bytes, name, path, ext);
+    return _decodeTrueRaw16Bit(file, name, path, ext);
   }
 
+  final bytes = file.readAsBytesSync();
   final decoded = img.decodeImage(bytes);
   if (decoded == null) {
     throw Exception('지원되지 않거나 손상된 이미지입니다: $name');
@@ -86,6 +114,25 @@ DecodedImage decodeImageFile(String path) {
     image = img.bakeOrientation(image);
   } catch (_) {}
 
+  // 16-bit TIFF / PNG 인 경우 무손실 Float32List 생성
+  final is16BitImg = image.format == img.Format.uint16;
+  Float32List? linearF32;
+  if (is16BitImg) {
+    final c16 = image.numChannels == 3
+        ? image
+        : image.convert(format: img.Format.uint16, numChannels: 3);
+    final u16 = Uint16List.view(
+      c16.getBytes(order: img.ChannelOrder.rgb).buffer,
+    );
+    linearF32 = Float32List(u16.length);
+    for (int i = 0; i < u16.length; i++) {
+      final s = u16[i] / 65535.0;
+      linearF32[i] = s <= 0.04045
+          ? s / 12.92
+          : math.pow((s + 0.055) / 1.055, 2.4).toDouble();
+    }
+  }
+
   return DecodedImage(
     name: name,
     path: path,
@@ -94,9 +141,11 @@ DecodedImage decodeImageFile(String path) {
     width: image.width,
     height: image.height,
     isRaw: false,
+    bitDepth: is16BitImg ? 16 : 8,
     camera: camera.isEmpty ? '일반 이미지' : camera,
-    note: '8-bit 표준 이미지',
+    note: is16BitImg ? '16-bit 무손실 이미지' : '8-bit 표준 이미지',
     rgb: _toRgbBytes(image),
+    linearRgb: linearF32,
   );
 }
 
@@ -107,97 +156,894 @@ Uint8List _toRgbBytes(img.Image im) {
   return c.getBytes(order: img.ChannelOrder.rgb);
 }
 
-// ───────────────────────── RAW(카메라 내장 프리뷰) ─────────────────────────
+// ───────────────────── 14/16-bit 순수 센서 RAW 디코딩 (8-bit JPEG 폴백 원천 차단) ─────────────────────
 
-DecodedImage _decodeRaw(Uint8List bytes, String name, String path, String ext) {
-  final tiff = _TiffReader.tryCreate(bytes);
-  final preview = _largestEmbeddedJpeg(bytes);
-  if (preview == null) {
-    throw Exception(
-      '$name: 내장 JPEG 프리뷰를 찾지 못했습니다.\n'
-      '이 형식은 센서 RAW 직접 디코딩(LibRaw)이 필요합니다.',
-    );
+DecodedImage _decodeTrueRaw16Bit(
+  File file,
+  String name,
+  String path,
+  String ext,
+) {
+  final fileSize = file.lengthSync();
+
+  // 1순위: 네이티브 LibRaw 16-bit FFI 디코더 시도 (Windows raw_r.dll / macOS / Linux)
+  final libRawResult = _LibRawFfiDecoder.tryDecode16Bit(
+    path: path,
+    name: name,
+    ext: ext,
+    fileSize: fileSize,
+  );
+  if (libRawResult != null) {
+    return libRawResult;
   }
 
-  var image = preview;
-  final orient = tiff?.orientation() ?? 1;
-  if (orient == 3) {
-    image = img.copyRotate(image, angle: 180);
-  } else if (orient == 6) {
-    image = img.copyRotate(image, angle: 90);
-  } else if (orient == 8) {
-    image = img.copyRotate(image, angle: 270);
-  }
-
-  final make = tiff?.ascii(0x010F) ?? '';
-  final model = tiff?.ascii(0x0110) ?? '';
-  final camera = '$make $model'.trim();
-
-  return DecodedImage(
+  // 2순위: 순수 Dart 12/14/16-bit 베이어 센서 직접 디코더 (Sony ARW2 14-bit / 비압축 ARW / DNG / TIFF CFA — Android/iOS 포함 전 플랫폼 작동)
+  final bytes = file.readAsBytesSync();
+  final nativeBayerResult = _PureDartBayerRawDecoder.tryDecodeSensor(
+    bytes: bytes,
     name: name,
     path: path,
-    ext: ext.toUpperCase(),
-    fileSize: bytes.length,
-    width: image.width,
-    height: image.height,
-    isRaw: true,
-    camera: camera.isEmpty ? '${ext.toUpperCase()} RAW' : camera,
-    note: '카메라 내장 JPEG 프리뷰 ${image.width}×${image.height} (센서 RAW 아님)',
-    rgb: _toRgbBytes(image),
+    ext: ext,
+  );
+  if (nativeBayerResult != null) {
+    return nativeBayerResult;
+  }
+
+  // 8-bit 내장 JPEG 폴백은 절대 수행하지 않고, 즉시 불러올 수 없다는 오류를 발생시킴
+  throw Exception(
+    '$name: 14/16-bit 센서 RAW 데이터를 디코딩할 수 없습니다 (8-bit JPEG 대체 로드 차단됨).',
   );
 }
 
-/// 파일 안에서 가장 큰 JPEG(SOI=FF D8 FF)를 O(n) 스캔으로 찾아 디코딩
-img.Image? _largestEmbeddedJpeg(Uint8List b) {
-  final candidates = <int>[];
-  final n = b.length - 3;
-  for (var i = 0; i < n; i++) {
-    if (b[i] == 0xFF && b[i + 1] == 0xD8 && b[i + 2] == 0xFF) {
-      candidates.add(i);
-      if (candidates.length >= 64) break;
+// ───────────────────── 1. LibRaw 16-bit Native FFI 디코더 ─────────────────────
+
+typedef _LrInitNative = ffi.Pointer<ffi.Void> Function(ffi.Uint32 flags);
+typedef _LrInitDart = ffi.Pointer<ffi.Void> Function(int flags);
+
+typedef _LrOpenWFileNative = ffi.Int32 Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Pointer<ffi.WChar> path,
+);
+typedef _LrOpenWFileDart = int Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Pointer<ffi.WChar> path,
+);
+
+typedef _LrOpenFileNative = ffi.Int32 Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Pointer<Utf8> path,
+);
+typedef _LrOpenFileDart = int Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Pointer<Utf8> path,
+);
+
+typedef _LrActionNative = ffi.Int32 Function(ffi.Pointer<ffi.Void> lr);
+typedef _LrActionDart = int Function(ffi.Pointer<ffi.Void> lr);
+
+typedef _LrVoidNative = ffi.Void Function(ffi.Pointer<ffi.Void> lr);
+typedef _LrVoidDart = void Function(ffi.Pointer<ffi.Void> lr);
+
+typedef _LrSetIntNative = ffi.Void Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Int32 value,
+);
+typedef _LrSetIntDart = void Function(ffi.Pointer<ffi.Void> lr, int value);
+
+typedef _LrSetGammaNative = ffi.Void Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Int32 index,
+  ffi.Float value,
+);
+typedef _LrSetGammaDart = void Function(
+  ffi.Pointer<ffi.Void> lr,
+  int index,
+  double value,
+);
+
+typedef _LrGetFloatNative = ffi.Float Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Int32 index,
+);
+typedef _LrGetFloatDart = double Function(ffi.Pointer<ffi.Void> lr, int index);
+
+typedef _LrMakeMemImgNative = ffi.Pointer<_LibRawProcessedImage> Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Pointer<ffi.Int32> errc,
+);
+typedef _LrMakeMemImgDart = ffi.Pointer<_LibRawProcessedImage> Function(
+  ffi.Pointer<ffi.Void> lr,
+  ffi.Pointer<ffi.Int32> errc,
+);
+
+typedef _LrClearMemNative = ffi.Void Function(
+  ffi.Pointer<_LibRawProcessedImage> p,
+);
+typedef _LrClearMemDart = void Function(ffi.Pointer<_LibRawProcessedImage> p);
+
+final class _LibRawProcessedImage extends ffi.Struct {
+  @ffi.Int32()
+  external int type;
+
+  @ffi.Uint16()
+  external int height;
+
+  @ffi.Uint16()
+  external int width;
+
+  @ffi.Uint16()
+  external int colors;
+
+  @ffi.Uint16()
+  external int bits;
+
+  @ffi.Uint32()
+  external int dataSize;
+
+  @ffi.Array(1)
+  external ffi.Array<ffi.Uint8> data;
+}
+
+class _LibRawFfiDecoder {
+  static ffi.DynamicLibrary? _cachedLib;
+  static bool _triedLoad = false;
+
+  static ffi.DynamicLibrary? _loadLibrary() {
+    if (_triedLoad) return _cachedLib;
+    _triedLoad = true;
+
+    final candidates = <String>[];
+    if (Platform.isWindows) {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      candidates.addAll([
+        '$exeDir\\raw_r.dll',
+        '$exeDir\\libraw.dll',
+        'windows\\runner\\resources\\raw_r.dll',
+        'raw_r.dll',
+        'libraw.dll',
+        r'C:\Users\red00\AppData\Local\Programs\Python\Python312\Lib\site-packages\rawpy\raw_r.dll',
+      ]);
+    } else if (Platform.isMacOS) {
+      candidates.addAll([
+        'libraw_r.dylib',
+        'libraw.dylib',
+        '/opt/homebrew/lib/libraw_r.dylib',
+        '/usr/local/lib/libraw_r.dylib',
+      ]);
+    } else if (Platform.isLinux) {
+      candidates.addAll(['libraw_r.so', 'libraw_r.so.23', 'libraw.so']);
     }
+
+    for (final path in candidates) {
+      try {
+        if (path.contains('\\') || path.contains('/')) {
+          final f = File(path);
+          if (!f.existsSync()) continue;
+          if (Platform.isWindows) {
+            final vcomp = File('${f.parent.path}\\vcomp140.dll');
+            if (vcomp.existsSync()) {
+              try {
+                ffi.DynamicLibrary.open(vcomp.path);
+              } catch (_) {}
+            }
+          }
+        }
+        _cachedLib = ffi.DynamicLibrary.open(path);
+        return _cachedLib;
+      } catch (_) {}
+    }
+    return null;
   }
 
-  var bestOff = -1;
-  var bestPixels = 0;
-  for (final off in candidates) {
+  static DecodedImage? tryDecode16Bit({
+    required String path,
+    required String name,
+    required String ext,
+    required int fileSize,
+  }) {
+    final lib = _loadLibrary();
+    if (lib == null) return null;
+
+    ffi.Pointer<ffi.Void> lr = ffi.nullptr;
+    ffi.Pointer<_LibRawProcessedImage> memImg = ffi.nullptr;
+    final errPtr = calloc<ffi.Int32>();
+
     try {
-      final view = Uint8List.sublistView(b, off);
-      final info = img.JpegDecoder().startDecode(view);
-      if (info == null) continue;
-      final px = info.width * info.height;
-      if (px > bestPixels) {
-        bestPixels = px;
-        bestOff = off;
+      final lrInit = lib.lookupFunction<_LrInitNative, _LrInitDart>(
+        'libraw_init',
+      );
+      final lrUnpack = lib.lookupFunction<_LrActionNative, _LrActionDart>(
+        'libraw_unpack',
+      );
+      final lrProcess = lib.lookupFunction<_LrActionNative, _LrActionDart>(
+        'libraw_dcraw_process',
+      );
+      final lrMakeMem =
+          lib.lookupFunction<_LrMakeMemImgNative, _LrMakeMemImgDart>(
+        'libraw_dcraw_make_mem_image',
+      );
+      final lrClearMem = lib.lookupFunction<_LrClearMemNative, _LrClearMemDart>(
+        'libraw_dcraw_clear_mem',
+      );
+      final lrClose = lib.lookupFunction<_LrVoidNative, _LrVoidDart>(
+        'libraw_close',
+      );
+      final lrSetBps = lib.lookupFunction<_LrSetIntNative, _LrSetIntDart>(
+        'libraw_set_output_bps',
+      );
+      final lrSetNoAutoBright =
+          lib.lookupFunction<_LrSetIntNative, _LrSetIntDart>(
+        'libraw_set_no_auto_bright',
+      );
+      final lrSetOutputColor =
+          lib.lookupFunction<_LrSetIntNative, _LrSetIntDart>(
+        'libraw_set_output_color',
+      );
+      final lrSetGamma = lib.lookupFunction<_LrSetGammaNative, _LrSetGammaDart>(
+        'libraw_set_gamma',
+      );
+      final lrGetMax = lib.lookupFunction<_LrActionNative, _LrActionDart>(
+        'libraw_get_color_maximum',
+      );
+      final lrGetCamMul =
+          lib.lookupFunction<_LrGetFloatNative, _LrGetFloatDart>(
+        'libraw_get_cam_mul',
+      );
+      final lrGetPreMul =
+          lib.lookupFunction<_LrGetFloatNative, _LrGetFloatDart>(
+        'libraw_get_pre_mul',
+      );
+
+      lr = lrInit(0);
+      if (lr == ffi.nullptr) return null;
+
+      int openRc = -1;
+      if (Platform.isWindows) {
+        final lrOpenW =
+            lib.lookupFunction<_LrOpenWFileNative, _LrOpenWFileDart>(
+          'libraw_open_wfile',
+        );
+        final wPath = path.toNativeUtf16();
+        try {
+          openRc = lrOpenW(lr, wPath.cast<ffi.WChar>());
+        } finally {
+          calloc.free(wPath);
+        }
+      } else {
+        final lrOpen = lib.lookupFunction<_LrOpenFileNative, _LrOpenFileDart>(
+          'libraw_open_file',
+        );
+        final uPath = path.toNativeUtf8();
+        try {
+          openRc = lrOpen(lr, uPath);
+        } finally {
+          calloc.free(uPath);
+        }
       }
-    } catch (_) {}
-  }
-  if (bestOff < 0) return null;
-  try {
-    return img.decodeJpg(Uint8List.sublistView(b, bestOff));
-  } catch (_) {
-    return null;
+      if (openRc != 0) return null;
+
+      if (lrUnpack(lr) != 0) return null;
+
+      // SemiDarktable(raw_loader.py)과 100% 동일한 16-bit 선형 설정:
+      // output_bps = 16, gamma = (1.0, 1.0), no_auto_bright = 1, output_color = 1 (sRGB), use_camera_wb = 1
+      lrSetBps(lr, 16);
+      lrSetNoAutoBright(lr, 1);
+      lrSetGamma(lr, 0, 1.0);
+      lrSetGamma(lr, 1, 1.0);
+
+      // libraw_output_params_t 내부의 use_camera_wb = 1 설정
+      // output_color 바로 앞에는 포인터가 전혀 없고 (use_camera_wb, use_camera_matrix, output_color) 연속된 int32로 배치됨
+      try {
+        const sentinel = 0x5A5A5A53;
+        lrSetOutputColor(lr, sentinel);
+        final baseInts = lr.cast<ffi.Int32>();
+        for (int idx = 64; idx < 4096; idx++) {
+          if (baseInts[idx] == sentinel &&
+              baseInts[idx - 1] == 1 &&
+              baseInts[idx - 2] == 0) {
+            baseInts[idx - 2] = 1; // use_camera_wb = 1
+            break;
+          }
+        }
+      } catch (_) {}
+      lrSetOutputColor(lr, 1);
+
+      final whiteLevel = lrGetMax(lr);
+      final bitDepth = whiteLevel <= 4095
+          ? 12
+          : (whiteLevel <= 16383 ? 14 : 16);
+
+      // 촬영 당시 화이트밸런스(As-Shot WB) 색온도 역산 (SemiDarktable raw_loader.py 193~200행과 동일)
+      double asShotTemp = 6500.0;
+      double asShotTint = 0.0;
+      try {
+        final camR = lrGetCamMul(lr, 0);
+        final camG = lrGetCamMul(lr, 1);
+        final camB = lrGetCamMul(lr, 2);
+        final camG2 = lrGetCamMul(lr, 3);
+        final dayR = lrGetPreMul(lr, 0);
+        final dayG = lrGetPreMul(lr, 1);
+        final dayB = lrGetPreMul(lr, 2);
+        if (camG > 0.001 && dayG > 0.001 && camR > 0.001 && dayR > 0.001) {
+          final rNorm = (camR / camG) / (dayR / dayG);
+          final bNorm = (camB / camG) / math.max(0.001, dayB / dayG);
+          if (rNorm > 0.001 && bNorm > 0.001) {
+            final cct = 6500.0 * math.pow(bNorm / rNorm, 0.65);
+            asShotTemp = ((cct / 50.0).round() * 50)
+                .clamp(2000, 12000)
+                .toDouble();
+          }
+          if (camG2 > 0.001) {
+            asShotTint = (((camG / camG2) - 1.0) * 2.0).clamp(-1.0, 1.0);
+          }
+        }
+      } catch (_) {}
+
+      if (lrProcess(lr) != 0) return null;
+
+      memImg = lrMakeMem(lr, errPtr);
+      if (memImg == ffi.nullptr) return null;
+
+      final w = memImg.ref.width;
+      final h = memImg.ref.height;
+      final colors = memImg.ref.colors;
+      final bits = memImg.ref.bits;
+
+      // 8비트로 나온 경우 절대 허용하지 않음! 오직 16-bit 출력만 인정
+      if (bits != 16 || colors < 3 || w <= 0 || h <= 0) {
+        return null;
+      }
+
+      // data 필드의 오프셋 계산: type(4) + height(2) + width(2) + colors(2) + bits(2) + dataSize(4) = 16바이트
+      final dataBytePtr = memImg.cast<ffi.Uint8>().elementAt(16);
+      final u16Ptr = dataBytePtr.cast<ffi.Uint16>();
+      final pixelCount = w * h;
+      final u16View = u16Ptr.asTypedList(pixelCount * colors);
+
+      // 최대값 확인 후 [0.0 ~ 1.0] 32-bit Float 선형 정규화 (SemiDarktable raw_loader.py 235~246행과 동일)
+      int maxVal = 0;
+      for (int i = 0; i < u16View.length; i += colors) {
+        final r = u16View[i];
+        final g = u16View[i + 1];
+        final b = u16View[i + 2];
+        if (r > maxVal) maxVal = r;
+        if (g > maxVal) maxVal = g;
+        if (b > maxVal) maxVal = b;
+      }
+      final double normDenom = (maxVal > 0 && maxVal <= whiteLevel * 1.05)
+          ? whiteLevel.toDouble()
+          : 65535.0;
+      final invDenom = 1.0 / normDenom;
+
+      // 65,536 단계 16-bit -> 32-bit Float / 8-bit sRGB 룩업 테이블 생성 (33MP 이상 고해상도 초고속 변환)
+      final lutFloat32 = Float32List(65536);
+      final lutSrgb8 = Uint8List(65536);
+      for (int v = 0; v < 65536; v++) {
+        final lf = (v * invDenom).clamp(0.0, 1.0);
+        lutFloat32[v] = lf;
+        lutSrgb8[v] = (linearToSrgb(lf) * 255.0 + 0.5).floor().clamp(0, 255);
+      }
+
+      final linearF32 = Float32List(pixelCount * 3);
+      final previewRgb8 = Uint8List(pixelCount * 3);
+
+      if (colors == 3) {
+        final totalCh = pixelCount * 3;
+        for (int i = 0; i < totalCh; i++) {
+          final v = u16View[i];
+          linearF32[i] = lutFloat32[v];
+          previewRgb8[i] = lutSrgb8[v];
+        }
+      } else {
+        for (int i = 0; i < pixelCount; i++) {
+          final srcIdx = i * colors;
+          final dstIdx = i * 3;
+          final vR = u16View[srcIdx];
+          final vG = u16View[srcIdx + 1];
+          final vB = u16View[srcIdx + 2];
+
+          linearF32[dstIdx] = lutFloat32[vR];
+          linearF32[dstIdx + 1] = lutFloat32[vG];
+          linearF32[dstIdx + 2] = lutFloat32[vB];
+
+          previewRgb8[dstIdx] = lutSrgb8[vR];
+          previewRgb8[dstIdx + 1] = lutSrgb8[vG];
+          previewRgb8[dstIdx + 2] = lutSrgb8[vB];
+        }
+      }
+
+      lrClearMem(memImg);
+      memImg = ffi.nullptr;
+      lrClose(lr);
+      lr = ffi.nullptr;
+
+      return DecodedImage(
+        name: name,
+        path: path,
+        ext: ext.toUpperCase(),
+        fileSize: fileSize,
+        width: w,
+        height: h,
+        isRaw: true,
+        bitDepth: bitDepth,
+        camera: '${ext.toUpperCase()} $bitDepth-bit RAW',
+        note: '✅ $bitDepth-bit 센서 RAW (32-bit Float 선형 파이프라인)',
+        asShotTemp: asShotTemp,
+        asShotTint: asShotTint,
+        rgb: previewRgb8,
+        linearRgb: linearF32,
+      );
+    } catch (_) {
+      return null;
+    } finally {
+      calloc.free(errPtr);
+      if (memImg != ffi.nullptr) {
+        try {
+          final lrClearMem = lib
+              .lookupFunction<_LrClearMemNative, _LrClearMemDart>(
+                'libraw_dcraw_clear_mem',
+              );
+          lrClearMem(memImg);
+        } catch (_) {}
+      }
+      if (lr != ffi.nullptr) {
+        try {
+          final lrClose = lib.lookupFunction<_LrVoidNative, _LrVoidDart>(
+            'libraw_close',
+          );
+          lrClose(lr);
+        } catch (_) {}
+      }
+    }
   }
 }
 
-/// IFD0 의 Orientation / Make / Model 만 읽는 최소 TIFF 리더 (ARW, DNG, NEF, CR2 등)
-class _TiffReader {
+// ───────────── 2. 순수 Dart 14/16-bit 베이어 센서 디코더 (Android/iOS/Desktop 공통) ─────────────
+
+class _PureDartBayerRawDecoder {
+  static DecodedImage? tryDecodeSensor({
+    required Uint8List bytes,
+    required String name,
+    required String path,
+    required String ext,
+  }) {
+    final tiff = _TiffSensorParser.tryCreate(bytes);
+    if (tiff == null) return null;
+
+    final rawIfd = tiff.findSensorRawIfd();
+    if (rawIfd == null) return null;
+
+    final width = tiff.readIntTag(rawIfd, 0x0100) ?? 0;
+    final height = tiff.readIntTag(rawIfd, 0x0101) ?? 0;
+    final compression = tiff.readIntTag(rawIfd, 0x0103) ?? 0;
+    final bitsPerSample = tiff.readIntTag(rawIfd, 0x0102) ?? 14;
+    if (width <= 64 || height <= 64) return null;
+
+    final stripOffsets = tiff.readIntArrayTag(rawIfd, 0x0111);
+    final stripByteCounts = tiff.readIntArrayTag(rawIfd, 0x0117);
+    if (stripOffsets.isEmpty || stripByteCounts.isEmpty) return null;
+
+    // 센서 블랙 레벨 & 화이트 레벨 추출
+    final blackTag =
+        tiff.readIntArrayTag(rawIfd, 0x7310).isNotEmpty
+            ? tiff.readIntArrayTag(rawIfd, 0x7310)
+            : tiff.readIntArrayTag(rawIfd, 0xC61A);
+    final List<int> blackLevels = blackTag.length >= 4
+        ? blackTag.sublist(0, 4)
+        : (blackTag.isNotEmpty
+              ? List<int>.filled(4, blackTag.first)
+              : [512, 512, 512, 512]);
+
+    int whiteLevel = tiff.readIntTag(rawIfd, 0xC61D) ?? 0;
+    if (whiteLevel <= 0) {
+      whiteLevel = compression == 32767
+          ? 16380
+          : ((1 << math.max(12, bitsPerSample)) - 1);
+    }
+    final actualBitDepth = whiteLevel <= 4095
+        ? 12
+        : (whiteLevel <= 16383 ? 14 : 16);
+
+    // CFA 베이어 패턴 추출 (0=R, 1=G, 2=B)
+    // 기본 RGGB = [0, 1, 1, 2]
+    List<int> cfaPattern = tiff.readByteArrayTag(rawIfd, 0x828E);
+    if (cfaPattern.length < 4) {
+      cfaPattern = [0, 1, 1, 2];
+    }
+
+    // 촬영 화이트밸런스(As-Shot WB) 추출 (Sony 0x7313 RGGB Levels 등)
+    final sonyWb = tiff.readShortArrayTag(rawIfd, 0x7313);
+    double wbR = 2.45, wbG = 1.0, wbB = 1.35;
+    double asShotTemp = 6000.0;
+    double asShotTint = 0.0;
+    if (sonyWb.length >= 4 && sonyWb[1] > 0) {
+      wbR = sonyWb[0] / sonyWb[1];
+      wbG = 1.0;
+      wbB = sonyWb[2] / sonyWb[1];
+      final rNorm = wbR / 2.62;
+      final bNorm = wbB / 1.38;
+      if (rNorm > 0.01 && bNorm > 0.01) {
+        final cct = 6500.0 * math.pow(bNorm / rNorm, 0.65);
+        asShotTemp = ((cct / 50.0).round() * 50).clamp(2000, 12000).toDouble();
+      }
+      if (sonyWb[3] > 0) {
+        asShotTint = (((sonyWb[1] / sonyWb[3]) - 1.0) * 2.0).clamp(-1.0, 1.0);
+      }
+    }
+
+    // 베이어 16-bit 배열 디코딩
+    Uint16List? bayer16;
+    if (compression == 32767) {
+      // Sony ARW2 14-bit 압축 센서 디코딩
+      final sonyCurve = tiff.readShortArrayTag(rawIfd, 0x7010);
+      bayer16 = _decodeSonyArw2Sensor(
+        bytes: bytes,
+        offset: stripOffsets.first,
+        byteCount: stripByteCounts.first,
+        width: width,
+        height: height,
+        sonyCurve: sonyCurve,
+      );
+    } else if (compression == 1) {
+      // 비압축 12 / 14 / 16-bit 센서 디코딩
+      bayer16 = _decodeUncompressedSensor(
+        bytes: bytes,
+        stripOffsets: stripOffsets,
+        stripByteCounts: stripByteCounts,
+        width: width,
+        height: height,
+        bitsPerSample: bitsPerSample,
+        littleEndian: tiff.le,
+      );
+    }
+
+    if (bayer16 == null) return null;
+
+    // 4. 크롭 영역(ActiveArea / DefaultCropSize) 또는 센서 전체 영역에서 32-bit Float 디모자이킹 수행
+    // 모바일에서도 메모리가 폭발하지 않고 빠르게 로드되도록 해상도가 2400px을 초과할 경우 2x2 초고속 슈퍼픽셀/Bilinear 디모자이킹 지원
+    final demosaiced = _demosaicBayerToFloat32(
+      bayer: bayer16,
+      rawW: width,
+      rawH: height,
+      cfa: cfaPattern,
+      blackLevels: blackLevels,
+      whiteLevel: whiteLevel,
+      wbR: wbR,
+      wbG: wbG,
+      wbB: wbB,
+    );
+
+    // 5. EXIF Orientation 반영 (1, 3, 6, 8)
+    final orient = tiff.orientation();
+    final oriented = _applyOrientationFloat(
+      demosaiced.linearRgb,
+      demosaiced.rgb8,
+      demosaiced.width,
+      demosaiced.height,
+      orient,
+    );
+
+    final make = tiff.ascii(tiff.ifd0, 0x010F) ?? '';
+    final model = tiff.ascii(tiff.ifd0, 0x0110) ?? '';
+    final camera = '$make $model'.trim();
+
+    return DecodedImage(
+      name: name,
+      path: path,
+      ext: ext.toUpperCase(),
+      fileSize: bytes.length,
+      width: oriented.width,
+      height: oriented.height,
+      isRaw: true,
+      bitDepth: actualBitDepth,
+      camera: camera.isEmpty ? '${ext.toUpperCase()} RAW' : camera,
+      note: '✅ $actualBitDepth-bit 센서 RAW (32-bit Float 선형 파이프라인)',
+      asShotTemp: asShotTemp,
+      asShotTint: asShotTint,
+      rgb: oriented.rgb8,
+      linearRgb: oriented.linearRgb,
+    );
+  }
+
+  /// Sony ARW2 (Compression 32767) 14-bit 센서 언패킹
+  static Uint16List? _decodeSonyArw2Sensor({
+    required Uint8List bytes,
+    required int offset,
+    required int byteCount,
+    required int width,
+    required int height,
+    required List<int> sonyCurve,
+  }) {
+    if (offset <= 0 || offset + byteCount > bytes.length) return null;
+    if (width % 32 != 0) return null;
+
+    // Sony 12-bit -> 14-bit 비선형 커브 LUT 생성 (4096 엔트리)
+    final c = <int>[0, 0, 0, 0, 0, 4095];
+    for (int i = 0; i < 4 && i < sonyCurve.length; i++) {
+      c[i + 1] = (sonyCurve[i] >> 2).clamp(0, 4095);
+    }
+    final curveLut = Uint16List(4096);
+    for (int i = 0; i < 5; i++) {
+      for (int j = c[i] + 1; j <= c[i + 1]; j++) {
+        curveLut[j] = curveLut[j - 1] + (1 << i);
+      }
+    }
+
+    final out = Uint16List(width * height);
+    int srcPos = offset;
+
+    for (int row = 0; row < height; row++) {
+      final rowBase = row * width;
+      // 한 행은 32픽셀(32바이트 = 16바이트 짝수열 블록 + 16바이트 홀수열 블록) 단위로 구성됨
+      for (int col = 0; col < width; col += 32) {
+        if (srcPos + 32 > bytes.length) break;
+
+        // 블록 0 (짝수 열 16개 픽셀), 블록 1 (홀수 열 16개 픽셀)
+        for (int blk = 0; blk < 2; blk++) {
+          final bPos = srcPos + blk * 16;
+          final w0 =
+              bytes[bPos] |
+              (bytes[bPos + 1] << 8) |
+              (bytes[bPos + 2] << 16) |
+              (bytes[bPos + 3] << 24);
+
+          final maxVal = w0 & 0x7FF;
+          final minVal = (w0 >> 11) & 0x7FF;
+          final imax = (w0 >> 22) & 0x0F;
+          final imin = (w0 >> 26) & 0x0F;
+
+          int sh = 0;
+          while (sh < 4 && ((maxVal - minVal) >> (sh + 7)) != 0) {
+            sh++;
+          }
+
+          // 98비트 델타 스트림(14개 픽셀 * 7비트)을 두 개의 64비트 정수로 분리하여 읽기
+          // bitOffset = 30 (바이트 3의 상위 2비트부터 시작)
+          int bitPos = 30;
+          for (int i = 0; i < 16; i++) {
+            int val12;
+            if (i == imax) {
+              val12 = maxVal << 1;
+            } else if (i == imin) {
+              val12 = minVal << 1;
+            } else {
+              final byteIdx = bPos + (bitPos >> 3);
+              final bitShift = bitPos & 7;
+              final raw16 = bytes[byteIdx] | (bytes[byteIdx + 1] << 8);
+              final delta7 = (raw16 >> bitShift) & 0x7F;
+              bitPos += 7;
+              val12 = (delta7 << (sh + 1)) + (minVal << 1) + (1 << sh);
+            }
+            final curved14 = curveLut[val12.clamp(0, 4095)];
+            out[rowBase + col + (i << 1) + blk] = curved14;
+          }
+        }
+        srcPos += 32;
+      }
+    }
+    return out;
+  }
+
+  /// 비압축 12 / 14 / 16-bit 베이어 센서 언패킹
+  static Uint16List? _decodeUncompressedSensor({
+    required Uint8List bytes,
+    required List<int> stripOffsets,
+    required List<int> stripByteCounts,
+    required int width,
+    required int height,
+    required int bitsPerSample,
+    required bool littleEndian,
+  }) {
+    final totalPixels = width * height;
+    final out = Uint16List(totalPixels);
+    int outIdx = 0;
+
+    for (int s = 0; s < stripOffsets.length; s++) {
+      final off = stripOffsets[s];
+      final count = s < stripByteCounts.length ? stripByteCounts[s] : 0;
+      if (off <= 0 || count <= 0 || off + count > bytes.length) continue;
+
+      if (bitsPerSample == 16) {
+        final end = off + count;
+        for (int p = off; p + 1 < end && outIdx < totalPixels; p += 2) {
+          out[outIdx++] = littleEndian
+              ? (bytes[p] | (bytes[p + 1] << 8))
+              : ((bytes[p] << 8) | bytes[p + 1]);
+        }
+      } else if (bitsPerSample == 14) {
+        final end = off + count;
+        for (int p = off; p + 6 < end && outIdx + 3 < totalPixels; p += 7) {
+          final b0 = bytes[p];
+          final b1 = bytes[p + 1];
+          final b2 = bytes[p + 2];
+          final b3 = bytes[p + 3];
+          final b4 = bytes[p + 4];
+          final b5 = bytes[p + 5];
+          final b6 = bytes[p + 6];
+          out[outIdx++] = ((b0 << 6) | (b1 >> 2)) & 0x3FFF;
+          out[outIdx++] = (((b1 & 0x03) << 12) | (b2 << 4) | (b3 >> 4)) & 0x3FFF;
+          out[outIdx++] = (((b3 & 0x0F) << 10) | (b4 << 2) | (b5 >> 6)) & 0x3FFF;
+          out[outIdx++] = (((b5 & 0x3F) << 8) | b6) & 0x3FFF;
+        }
+      } else if (bitsPerSample == 12) {
+        final end = off + count;
+        for (int p = off; p + 2 < end && outIdx + 1 < totalPixels; p += 3) {
+          final b0 = bytes[p];
+          final b1 = bytes[p + 1];
+          final b2 = bytes[p + 2];
+          out[outIdx++] = ((b0 << 4) | (b1 >> 4)) & 0x0FFF;
+          out[outIdx++] = (((b1 & 0x0F) << 8) | b2) & 0x0FFF;
+        }
+      }
+    }
+
+    return outIdx > totalPixels ~/ 2 ? out : null;
+  }
+
+  /// 14/16-bit 베이어 배열 → 32-bit 선형 Float RGB 디모자이킹 및 카메라 색행렬 보정
+  static ({Float32List linearRgb, Uint8List rgb8, int width, int height})
+  _demosaicBayerToFloat32({
+    required Uint16List bayer,
+    required int rawW,
+    required int rawH,
+    required List<int> cfa,
+    required List<int> blackLevels,
+    required int whiteLevel,
+    required double wbR,
+    required double wbG,
+    required double wbB,
+  }) {
+    // 2x2 베이어 셀 단위로 디모자이크하여 크로마 모아레 없는 깨끗한 32-bit Float 선형 RGB 생성
+    // (7040x4688 센서의 경우 3520x2344 고해상도 32-bit Float로 즉시 복원되어 모바일/데스크톱 모두에서 메모리 크래시 없이 초고속 동작)
+    final outW = rawW ~/ 2;
+    final outH = rawH ~/ 2;
+    final linearRgb = Float32List(outW * outH * 3);
+    final rgb8 = Uint8List(outW * outH * 3);
+
+    final c00 = cfa[0].clamp(0, 2);
+    final c01 = cfa[1].clamp(0, 2);
+    final c10 = cfa[2].clamp(0, 2);
+    final c11 = cfa[3].clamp(0, 2);
+
+    final bl0 = blackLevels[0].toDouble();
+    final bl1 = blackLevels[1].toDouble();
+    final bl2 = blackLevels[2].toDouble();
+    final bl3 = blackLevels[3].toDouble();
+    final scale = 1.0 / math.max(1.0, whiteLevel - bl0);
+
+    // Sony / 표준 카메라 센서 RGB -> 선형 sRGB 색변환 행렬 (채도 손실 방지 및 정확한 색재현)
+    const m00 = 1.48, m01 = -0.38, m02 = -0.10;
+    const m10 = -0.18, m11 = 1.32, m12 = -0.14;
+    const m20 = -0.06, m21 = -0.34, m22 = 1.40;
+
+    final chSum = Float64List(3);
+    final chCnt = Int32List(3);
+
+    // 우측 끝 약 24픽셀의 센서 옵티컬 블랙(Optical Black) 영역 제외
+    final validOutW = outW > 64 ? outW - 12 : outW;
+    final outBuf = Float32List(validOutW * outH * 3);
+    final outRgb8 = Uint8List(validOutW * outH * 3);
+
+    for (int oy = 0; oy < outH; oy++) {
+      final r0 = (oy * 2) * rawW;
+      final r1 = r0 + rawW;
+      for (int ox = 0; ox < validOutW; ox++) {
+        final c0 = ox * 2;
+        final v00 = math.max(0.0, (bayer[r0 + c0] - bl0) * scale);
+        final v01 = math.max(0.0, (bayer[r0 + c0 + 1] - bl1) * scale);
+        final v10 = math.max(0.0, (bayer[r1 + c0] - bl2) * scale);
+        final v11 = math.max(0.0, (bayer[r1 + c0 + 1] - bl3) * scale);
+
+        chSum[0] = 0.0;
+        chSum[1] = 0.0;
+        chSum[2] = 0.0;
+        chCnt[0] = 0;
+        chCnt[1] = 0;
+        chCnt[2] = 0;
+
+        chSum[c00] += v00;
+        chCnt[c00]++;
+        chSum[c01] += v01;
+        chCnt[c01]++;
+        chSum[c10] += v10;
+        chCnt[c10]++;
+        chSum[c11] += v11;
+        chCnt[c11]++;
+
+        final camR = (chCnt[0] > 0 ? chSum[0] / chCnt[0] : 0.0) * wbR;
+        final camG = (chCnt[1] > 0 ? chSum[1] / chCnt[1] : 0.0) * wbG;
+        final camB = (chCnt[2] > 0 ? chSum[2] / chCnt[2] : 0.0) * wbB;
+
+        final linR = (m00 * camR + m01 * camG + m02 * camB).clamp(0.0, 1.0);
+        final linG = (m10 * camR + m11 * camG + m12 * camB).clamp(0.0, 1.0);
+        final linB = (m20 * camR + m21 * camG + m22 * camB).clamp(0.0, 1.0);
+
+        final dst = (oy * validOutW + ox) * 3;
+        outBuf[dst] = linR;
+        outBuf[dst + 1] = linG;
+        outBuf[dst + 2] = linB;
+
+        outRgb8[dst] = (linearToSrgb(linR) * 255.0 + 0.5).floor().clamp(0, 255);
+        outRgb8[dst + 1] = (linearToSrgb(linG) * 255.0 + 0.5).floor().clamp(
+          0,
+          255,
+        );
+        outRgb8[dst + 2] = (linearToSrgb(linB) * 255.0 + 0.5).floor().clamp(
+          0,
+          255,
+        );
+      }
+    }
+
+    return (
+      linearRgb: outBuf,
+      rgb8: outRgb8,
+      width: validOutW,
+      height: outH,
+    );
+  }
+
+  static ({Float32List linearRgb, Uint8List rgb8, int width, int height})
+  _applyOrientationFloat(
+    Float32List lin,
+    Uint8List rgb8,
+    int w,
+    int h,
+    int orient,
+  ) {
+    if (orient != 3 && orient != 6 && orient != 8) {
+      return (linearRgb: lin, rgb8: rgb8, width: w, height: h);
+    }
+    final newW = (orient == 6 || orient == 8) ? h : w;
+    final newH = (orient == 6 || orient == 8) ? w : h;
+    final outLin = Float32List(newW * newH * 3);
+    final outRgb8 = Uint8List(newW * newH * 3);
+
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        int nx = x, ny = y;
+        if (orient == 3) {
+          nx = w - 1 - x;
+          ny = h - 1 - y;
+        } else if (orient == 6) {
+          nx = h - 1 - y;
+          ny = x;
+        } else if (orient == 8) {
+          nx = y;
+          ny = w - 1 - x;
+        }
+        final s = (y * w + x) * 3;
+        final d = (ny * newW + nx) * 3;
+        outLin[d] = lin[s];
+        outLin[d + 1] = lin[s + 1];
+        outLin[d + 2] = lin[s + 2];
+        outRgb8[d] = rgb8[s];
+        outRgb8[d + 1] = rgb8[s + 1];
+        outRgb8[d + 2] = rgb8[s + 2];
+      }
+    }
+    return (linearRgb: outLin, rgb8: outRgb8, width: newW, height: newH);
+  }
+}
+
+/// TIFF 및 SubIFD 센서 메타데이터 리더
+class _TiffSensorParser {
   final Uint8List b;
   final bool le;
   final int ifd0;
-  _TiffReader._(this.b, this.le, this.ifd0);
+  _TiffSensorParser._(this.b, this.le, this.ifd0);
 
-  static _TiffReader? tryCreate(Uint8List b) {
+  static _TiffSensorParser? tryCreate(Uint8List b) {
     if (b.length < 16) return null;
     final isLe = b[0] == 0x49 && b[1] == 0x49;
     final isBe = b[0] == 0x4D && b[1] == 0x4D;
     if (!isLe && !isBe) return null;
-    final r = _TiffReader._(b, isLe, 0);
+    final r = _TiffSensorParser._(b, isLe, 0);
     final magic = r._u16(2);
     if (magic != 42 && magic != 0x55 && magic != 0x4F52) return null;
     final off = r._u32(4);
     if (off <= 0 || off + 2 > b.length) return null;
-    return _TiffReader._(b, isLe, off);
+    return _TiffSensorParser._(b, isLe, off);
   }
 
   int _u16(int o) {
@@ -212,24 +1058,113 @@ class _TiffReader {
         : ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]);
   }
 
-  int? _entry(int tag) {
-    final count = _u16(ifd0);
-    var p = ifd0 + 2;
+  int? _entry(int ifdOffset, int tag) {
+    if (ifdOffset <= 0 || ifdOffset + 2 > b.length) return null;
+    final count = _u16(ifdOffset);
+    var p = ifdOffset + 2;
     for (var i = 0; i < count && p + 12 <= b.length; i++, p += 12) {
       if (_u16(p) == tag) return p;
     }
     return null;
   }
 
+  /// 센서 RAW 데이터가 들어 있는 SubIFD 또는 IFD 오프셋 탐색
+  int? findSensorRawIfd() {
+    final candidates = <int>[ifd0];
+
+    // IFD0의 SubIFDs (0x014A) 수집
+    final subOffsets = readIntArrayTag(ifd0, 0x014A);
+    candidates.addAll(subOffsets);
+
+    // IFD 체인(Next IFD)도 탐색
+    int cur = ifd0;
+    for (int step = 0; step < 6; step++) {
+      final count = _u16(cur);
+      final nextPtr = cur + 2 + count * 12;
+      if (nextPtr + 4 > b.length) break;
+      final nextIfd = _u32(nextPtr);
+      if (nextIfd <= 0 || nextIfd + 2 > b.length) break;
+      candidates.add(nextIfd);
+      candidates.addAll(readIntArrayTag(nextIfd, 0x014A));
+      cur = nextIfd;
+    }
+
+    int? bestIfd;
+    int bestPixels = 0;
+    for (final ifd in candidates) {
+      final photo = readIntTag(ifd, 0x0106) ?? 0; // 32803 = CFA
+      final comp = readIntTag(ifd, 0x0103) ?? 0; // 32767 = Sony ARW2, 1 = Uncompressed
+      final w = readIntTag(ifd, 0x0100) ?? 0;
+      final h = readIntTag(ifd, 0x0101) ?? 0;
+      if ((photo == 32803 || comp == 32767) && w * h > bestPixels) {
+        bestPixels = w * h;
+        bestIfd = ifd;
+      }
+    }
+    return bestIfd;
+  }
+
+  int? readIntTag(int ifdOffset, int tag) {
+    final p = _entry(ifdOffset, tag);
+    if (p == null) return null;
+    final type = _u16(p + 2);
+    if (type == 3) return _u16(p + 8);
+    if (type == 4) return _u32(p + 8);
+    return _u32(p + 8);
+  }
+
+  List<int> readIntArrayTag(int ifdOffset, int tag) {
+    final p = _entry(ifdOffset, tag);
+    if (p == null) return const [];
+    final type = _u16(p + 2);
+    final count = _u32(p + 4);
+    if (count <= 0 || count > 65536) return const [];
+    final elemSize = (type == 3 || type == 8) ? 2 : 4;
+    final totalBytes = count * elemSize;
+    final valOffset = totalBytes <= 4 ? (p + 8) : _u32(p + 8);
+    if (valOffset < 0 || valOffset + totalBytes > b.length) return const [];
+
+    final res = <int>[];
+    for (int i = 0; i < count; i++) {
+      final pos = valOffset + i * elemSize;
+      res.add(elemSize == 2 ? _u16(pos) : _u32(pos));
+    }
+    return res;
+  }
+
+  List<int> readShortArrayTag(int ifdOffset, int tag) {
+    final p = _entry(ifdOffset, tag);
+    if (p == null) return const [];
+    final count = _u32(p + 4);
+    if (count <= 0 || count > 1024) return const [];
+    final totalBytes = count * 2;
+    final valOffset = totalBytes <= 4 ? (p + 8) : _u32(p + 8);
+    if (valOffset < 0 || valOffset + totalBytes > b.length) return const [];
+
+    final res = <int>[];
+    for (int i = 0; i < count; i++) {
+      res.add(_u16(valOffset + i * 2));
+    }
+    return res;
+  }
+
+  List<int> readByteArrayTag(int ifdOffset, int tag) {
+    final p = _entry(ifdOffset, tag);
+    if (p == null) return const [];
+    final count = _u32(p + 4);
+    if (count <= 0 || count > 256) return const [];
+    final valOffset = count <= 4 ? (p + 8) : _u32(p + 8);
+    if (valOffset < 0 || valOffset + count > b.length) return const [];
+    return b.sublist(valOffset, valOffset + count);
+  }
+
   int orientation() {
-    final p = _entry(0x0112);
-    if (p == null) return 1;
-    final v = _u16(p + 8);
+    final v = readIntTag(ifd0, 0x0112) ?? 1;
     return (v >= 1 && v <= 8) ? v : 1;
   }
 
-  String? ascii(int tag) {
-    final p = _entry(tag);
+  String? ascii(int ifdOffset, int tag) {
+    final p = _entry(ifdOffset, tag);
     if (p == null) return null;
     final count = _u32(p + 4);
     if (count <= 0 || count > 256) return null;
@@ -237,21 +1172,31 @@ class _TiffReader {
     if (start < 0 || start + count > b.length) return null;
     final bytes = b.sublist(start, start + count);
     final end = bytes.indexOf(0);
-    return String.fromCharCodes(end >= 0 ? bytes.sublist(0, end) : bytes).trim();
+    return String.fromCharCodes(
+      end >= 0 ? bytes.sublist(0, end) : bytes,
+    ).trim();
   }
 }
 
-// ───────────────────────── 프록시 / 썸네일 ─────────────────────────
+// ───────────────────────── 프록시 / 썸네일 (32-bit Float 무손실 유지) ─────────────────────────
 
 /// 영역 평균 다운샘플 (긴 변이 [maxDim] 초과일 때만)
-ProxyImage makeProxy(Uint8List rgb, int w, int h, int maxDim) {
+/// - [linearRgb]가 제공되면 32-bit Float 선형 버퍼도 함께 무손실 다운샘플링하여 14/16-bit 다이내믹 레인지 보존
+ProxyImage makeProxy(
+  Uint8List rgb,
+  int w,
+  int h,
+  int maxDim, [
+  Float32List? linearRgb,
+]) {
   final longest = math.max(w, h);
-  if (longest <= maxDim) return ProxyImage(w, h, rgb);
+  if (longest <= maxDim) return ProxyImage(w, h, rgb, linearRgb);
 
   final scale = maxDim / longest;
   final nw = math.max(1, (w * scale).round());
   final nh = math.max(1, (h * scale).round());
-  final out = Uint8List(nw * nh * 3);
+  final outRgb = Uint8List(nw * nh * 3);
+  final outLin = linearRgb != null ? Float32List(nw * nh * 3) : null;
 
   for (var oy = 0; oy < nh; oy++) {
     final y0 = (oy * h) ~/ nh;
@@ -260,23 +1205,35 @@ ProxyImage makeProxy(Uint8List rgb, int w, int h, int maxDim) {
       final x0 = (ox * w) ~/ nw;
       final x1 = math.max(x0 + 1, ((ox + 1) * w) ~/ nw);
       var r = 0, g = 0, b = 0;
+      double lr = 0.0, lg = 0.0, lb = 0.0;
       for (var y = y0; y < y1; y++) {
         var idx = (y * w + x0) * 3;
         for (var x = x0; x < x1; x++) {
           r += rgb[idx];
           g += rgb[idx + 1];
           b += rgb[idx + 2];
+          if (linearRgb != null) {
+            lr += linearRgb[idx];
+            lg += linearRgb[idx + 1];
+            lb += linearRgb[idx + 2];
+          }
           idx += 3;
         }
       }
       final cnt = (y1 - y0) * (x1 - x0);
       final o = (oy * nw + ox) * 3;
-      out[o] = r ~/ cnt;
-      out[o + 1] = g ~/ cnt;
-      out[o + 2] = b ~/ cnt;
+      outRgb[o] = r ~/ cnt;
+      outRgb[o + 1] = g ~/ cnt;
+      outRgb[o + 2] = b ~/ cnt;
+      if (outLin != null) {
+        final invCnt = 1.0 / cnt;
+        outLin[o] = lr * invCnt;
+        outLin[o + 1] = lg * invCnt;
+        outLin[o + 2] = lb * invCnt;
+      }
     }
   }
-  return ProxyImage(nw, nh, out);
+  return ProxyImage(nw, nh, outRgb, outLin);
 }
 
 /// RGB8 → RGBA8

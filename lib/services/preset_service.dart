@@ -3,55 +3,15 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import '../models/pipeline_params.dart';
 
-/// SemiDarktable의 BUILTIN_PRESETS 및 사용자 프리셋 관리 서비스 1:1 이식
+/// SemiDarktable의 BUILTIN_PRESETS 및 사용자 프리셋 관리 서비스
+/// - Vivid Landscape, Warm Portrait 제거
+/// - 기존 내장 프리셋도 사용자가 원할 때 삭제(영구 숨김)할 수 있도록 지원
 class PresetService {
-  /// SemiDarktable main.py의 6개 기본 내장 프리셋과 100% 동일한 정규화 파라미터
+  static const String _deletedBuiltinsFileName = '_deleted_builtins.json';
+
+  /// 기본 내장 프리셋 (Default, Modern Film, Cinematic Moody, B&W Fine Art)
   static final Map<String, Map<String, dynamic>> builtinPresets = {
     '🔄 Default (초기화)': {},
-    '🌲 Vivid Landscape (풍경)': {
-      'exposure_enabled': true,
-      'exp_ev': 0.2,
-      'exp_contrast': 0.12,
-      'sigmoid_enabled': true,
-      'sig_contrast': 1.45,
-      'tone_equalizer_enabled': true,
-      'te_shadows': 0.35,
-      'te_highlights': -0.35,
-      'color_zones_enabled': true,
-      'sat_global': 0.15,
-      'sat_vibrance': 0.25,
-      'color_equalizer_enabled': true,
-      'ceq_sat': [0.0, 0.10, 0.15, 0.20, 0.15, 0.25, 0.0, 0.0],
-      'ceq_bri': [0.0, 0.0, 0.05, 0.0, -0.10, -0.15, 0.0, 0.0],
-      'dehaze_enabled': true,
-      'dh_strength': 0.20,
-      'local_contrast_enabled': true,
-      'lc_detail': 0.25,
-      'lc_clarity': 0.18,
-      'sharpen_enabled': true,
-      'sh_amount': 0.35,
-    },
-    '🌸 Warm Portrait (인물)': {
-      'exposure_enabled': true,
-      'exp_ev': 0.25,
-      'exp_contrast': -0.06,
-      'wb_enabled': true,
-      'wb_temperature': 5800.0,
-      'wb_tint': 0.04,
-      'tone_equalizer_enabled': true,
-      'te_shadows': 0.25,
-      'te_midtones': 0.1,
-      'te_highlights': -0.2,
-      'color_zones_enabled': true,
-      'sat_global': -0.05,
-      'sat_vibrance': 0.12,
-      'color_equalizer_enabled': true,
-      'ceq_bri': [0.08, 0.12, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05],
-      'ceq_sat': [-0.05, -0.08, 0.0, 0.0, 0.0, 0.0, 0.0, -0.05],
-      'local_contrast_enabled': true,
-      'lc_detail': 0.0,
-      'lc_clarity': -0.08,
-    },
     '🎞️ Modern Film (필름)': {
       'exposure_enabled': true,
       'exp_black_level': -0.025,
@@ -178,6 +138,7 @@ class PresetService {
       );
       for (final file in files) {
         final filename = file.uri.pathSegments.last;
+        if (filename == _deletedBuiltinsFileName) continue;
         final name = filename.substring(0, filename.length - 5);
         final content = await file.readAsString();
         final map = jsonDecode(content) as Map<String, dynamic>;
@@ -185,6 +146,30 @@ class PresetService {
       }
     } catch (_) {}
     return result;
+  }
+
+  /// 사용자가 삭제한 기본 내장 프리셋 이름 목록 로드
+  static Future<Set<String>> loadDeletedBuiltinPresets() async {
+    try {
+      final dir = await _getPresetsDir();
+      final file = File('${dir.path}/$_deletedBuiltinsFileName');
+      if (await file.exists()) {
+        final list = jsonDecode(await file.readAsString()) as List<dynamic>;
+        return list.map((e) => e.toString()).toSet();
+      }
+    } catch (_) {}
+    return <String>{};
+  }
+
+  /// 기본 내장 프리셋 삭제 기록 저장
+  static Future<void> markBuiltinPresetDeleted(String name) async {
+    try {
+      final deleted = await loadDeletedBuiltinPresets();
+      deleted.add(name);
+      final dir = await _getPresetsDir();
+      final file = File('${dir.path}/$_deletedBuiltinsFileName');
+      await file.writeAsString(jsonEncode(deleted.toList()));
+    } catch (_) {}
   }
 
   static Future<void> saveUserPreset(String name, PipelineParams params) async {
@@ -206,7 +191,11 @@ class PresetService {
     await file.writeAsString(const JsonEncoder.withIndent('  ').convert(map));
   }
 
-  static Future<void> deleteUserPreset(String name) async {
+  /// 내장 프리셋이든 사용자 프리셋이든 모두 삭제 가능하도록 처리
+  static Future<void> deletePreset(String name) async {
+    if (builtinPresets.containsKey(name)) {
+      await markBuiltinPresetDeleted(name);
+    }
     final dir = await _getPresetsDir();
     final safeName = name.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
     final file = File('${dir.path}/$safeName.json');

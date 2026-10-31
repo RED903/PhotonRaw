@@ -43,6 +43,7 @@ class ControlSlider extends StatefulWidget {
 class _ControlSliderState extends State<ControlSlider> {
   bool _isEditingText = false;
   late TextEditingController _textController;
+  final FocusNode _textFocusNode = FocusNode();
 
   double get _uiValue => (widget.value / widget.scale).clamp(widget.min, widget.max);
 
@@ -52,6 +53,14 @@ class _ControlSliderState extends State<ControlSlider> {
     _textController = TextEditingController(
       text: _uiValue.toStringAsFixed(widget.decimals),
     );
+    _textFocusNode.addListener(_onFocusChange);
+  }
+
+  void _onFocusChange() {
+    // 모바일 키보드 완료/내리기 또는 다른 영역 터치로 포커스가 해제될 때만 안전하게 수치 확정
+    if (!_textFocusNode.hasFocus && _isEditingText) {
+      _commitText(_textController.text);
+    }
   }
 
   @override
@@ -64,6 +73,8 @@ class _ControlSliderState extends State<ControlSlider> {
 
   @override
   void dispose() {
+    _textFocusNode.removeListener(_onFocusChange);
+    _textFocusNode.dispose();
     _textController.dispose();
     super.dispose();
   }
@@ -126,10 +137,11 @@ class _ControlSliderState extends State<ControlSlider> {
               _isEditingText
                   ? SizedBox(
                       width: 68,
-                      height: 22,
+                      height: 24,
                       child: TextField(
                         controller: _textController,
-                        autofocus: true,
+                        focusNode: _textFocusNode,
+                        textInputAction: TextInputAction.done,
                         keyboardType: const TextInputType.numberWithOptions(
                           signed: true,
                           decimal: true,
@@ -154,7 +166,6 @@ class _ControlSliderState extends State<ControlSlider> {
                           ),
                         ),
                         onSubmitted: _commitText,
-                        onTapOutside: (_) => _commitText(_textController.text),
                       ),
                     )
                   : GestureDetector(
@@ -167,6 +178,11 @@ class _ControlSliderState extends State<ControlSlider> {
                             baseOffset: 0,
                             extentOffset: _textController.text.length,
                           );
+                        });
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          if (mounted && _isEditingText) {
+                            _textFocusNode.requestFocus();
+                          }
                         });
                       },
                       onDoubleTap: _resetToDefault,

@@ -114,12 +114,14 @@ _DecodedFileBundle _decodeFileBundleTopLevel(String filePath) {
     decoded.width,
     decoded.height,
     1150,
+    decoded.linearRgb,
   );
   final fastProxy = makeProxy(
     qualityProxy.rgb,
     qualityProxy.width,
     qualityProxy.height,
     560,
+    qualityProxy.linearRgb,
   );
   final thumbProxy = makeProxy(
     fastProxy.rgb,
@@ -143,11 +145,12 @@ Future<_DecodedFileBundle> _runDecodeFileInIsolate(String filePath) {
   );
 }
 
-/// 내보내기용 순수 데이터 패킷 (Isolate 간 안전한 전달 보장)
+/// 내보내기용 순수 데이터 패킷 (Isolate 간 안전한 전달 보장 — 14/16-bit 무손실 linearRgb 포함)
 class _ExportIsolateJob {
   final int width;
   final int height;
   final Uint8List rgb;
+  final Float32List? linearRgb;
   final Map<String, dynamic> paramsMap;
   final String format;
   final int quality;
@@ -156,6 +159,7 @@ class _ExportIsolateJob {
     required this.width,
     required this.height,
     required this.rgb,
+    this.linearRgb,
     required this.paramsMap,
     required this.format,
     required this.quality,
@@ -164,9 +168,22 @@ class _ExportIsolateJob {
 
 /// 최상위(Top-level) 전체 해상도 렌더링 및 인코딩 함수
 Uint8List _encodeExportTopLevel(_ExportIsolateJob job) {
-  final fullSrc = ProxyImage(job.width, job.height, job.rgb);
+  final fullSrc = ProxyImage(job.width, job.height, job.rgb, job.linearRgb);
   final p = PipelineParams.fromMap(job.paramsMap);
   final fullRendered = renderFull(fullSrc, p);
+
+  if (job.format == 'tiff16') {
+    final rgb16 = toRgb16(fullRendered);
+    final outImg16 = img.Image.fromBytes(
+      width: fullRendered.width,
+      height: fullRendered.height,
+      bytes: rgb16.buffer,
+      numChannels: 3,
+      format: img.Format.uint16,
+    );
+    return Uint8List.fromList(img.encodeTiff(outImg16));
+  }
+
   final rgb8 = toRgb8(fullRendered);
   final outImg = img.Image.fromBytes(
     width: fullRendered.width,
@@ -176,8 +193,6 @@ Uint8List _encodeExportTopLevel(_ExportIsolateJob job) {
   );
   if (job.format == 'png') {
     return Uint8List.fromList(img.encodePng(outImg));
-  } else if (job.format == 'tiff16') {
-    return Uint8List.fromList(img.encodeTiff(outImg));
   } else {
     return Uint8List.fromList(img.encodeJpg(outImg, quality: job.quality));
   }
@@ -287,7 +302,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   Timer? _qualityDebounceTimer;
 
   bool _isLoadingFile = false;
-  String _statusMessage = '준비 완료 (v1.0.7) — 사진 또는 RAW 파일을 열어주세요';
+  String _statusMessage = '준비 완료 (v1.0.8) — 사진 또는 RAW 파일을 열어주세요';
 
   // 우측 모듈 필터 및 검색 상태 (SemiDarktable 6개 카테고리 탭과 동일)
   String _activeCategory = 'all'; // 'all', 'active', 'tone', 'color', 'geometry', 'detail'
@@ -315,10 +330,9 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   bool _softProofJpeg = false;
   bool _filmstripCollapsed = false;
 
-  // 복사/붙여넣기 클립보드 및 사용자 프리셋
-  Map<String, dynamic>? _copiedSettings;
+  // 사용자 프리셋 및 사용자가 삭제한 기본 내장 프리셋 목록
   Map<String, Map<String, dynamic>> _userPresets = {};
-  String _selectedPresetName = '🔄 Default (초기화)';
+  Set<String> _deletedBuiltinPresets = {};
 
   LoadedPhotoState? get _currentPhoto =>
       (_currentIndex >= 0 && _currentIndex < _photos.length)
@@ -358,8 +372,12 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
 
   Future<void> _loadUserPresets() async {
     final loaded = await PresetService.loadUserPresets();
+    final deletedBuiltins = await PresetService.loadDeletedBuiltinPresets();
     if (mounted) {
-      setState(() => _userPresets = loaded);
+      setState(() {
+        _userPresets = loaded;
+        _deletedBuiltinPresets = deletedBuiltins;
+      });
     }
   }
 
@@ -443,10 +461,10 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         );
 
         final initParams = PipelineParams()
-          ..wbAsShotTemp = 6500.0
-          ..wbAsShotTint = 0.0
-          ..wbTemperature = 6500.0
-          ..wbTint = 0.0;
+          ..wbAsShotTemp = bundle.decoded.asShotTemp
+          ..wbAsShotTint = bundle.decoded.asShotTint
+          ..wbTemperature = bundle.decoded.asShotTemp
+          ..wbTint = bundle.decoded.asShotTint;
 
         final fileName = path.split(RegExp(r'[/\\]')).last;
         final photoState = LoadedPhotoState(
@@ -745,45 +763,13 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     _triggerRender(fast: false);
   }
 
-  /// 현재 설정 복사 / 붙여넣기 / 전체 사진에 적용
-  void _copySettings() {
-    final photo = _currentPhoto;
-    if (photo == null) return;
-    _copiedSettings = photo.params.toMap();
-    _showSnack('현재 현상 설정이 복사되었습니다.');
-  }
-
-  void _pasteSettings() {
-    final photo = _currentPhoto;
-    if (photo == null || _copiedSettings == null) return;
-    _pushUndoSnapshot();
-    setState(() {
-      photo.params = PresetService.applyPresetMap(
-        photo.params,
-        _copiedSettings!,
-      );
-      _statusMessage = '복사된 현상 설정을 붙여넣었습니다.';
-    });
-    _triggerRender(fast: false);
-  }
-
-  void _pasteSettingsToAll() {
-    if (_photos.isEmpty || _copiedSettings == null) return;
-    for (final p in _photos) {
-      p.undoStack.add(p.params.toMap());
-      p.params = PresetService.applyPresetMap(p.params, _copiedSettings!);
-    }
-    setState(() {
-      _statusMessage = '로드된 모든 사진(${_photos.length}장)에 설정을 일괄 적용했습니다.';
-    });
-    _triggerRender(fast: false);
-  }
-
   /// 프리셋 선택 및 적용
   void _applyPresetByName(String name, {bool applyToAll = false}) {
     if (_photos.isEmpty) return;
-    Map<String, dynamic>? presetData = PresetService.builtinPresets[name];
-    presetData ??= _userPresets[name];
+    Map<String, dynamic>? presetData = _userPresets[name];
+    if (presetData == null && !_deletedBuiltinPresets.contains(name)) {
+      presetData = PresetService.builtinPresets[name];
+    }
     if (presetData == null) return;
 
     if (applyToAll) {
@@ -792,13 +778,11 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         p.params = PresetService.applyPresetMap(p.params, presetData);
       }
       setState(() {
-        _selectedPresetName = name;
         _statusMessage = '프리셋 "$name"을(를) 모든 사진에 일괄 적용했습니다.';
       });
     } else if (_currentPhoto != null) {
       _pushUndoSnapshot();
       setState(() {
-        _selectedPresetName = name;
         _currentPhoto!.params = PresetService.applyPresetMap(
           _currentPhoto!.params,
           presetData!,
@@ -809,7 +793,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     _triggerRender(fast: false);
   }
 
-  /// 프리셋 관리 다이얼로그 (SemiDarktable PresetManagerDialog 1:1 이식)
+  /// 프리셋 관리 다이얼로그 (기본 내장 프리셋 포함 모든 프리셋을 사용자가 삭제 가능하도록 지원)
   Future<void> _showPresetManagerDialog() async {
     final nameCtrl = TextEditingController();
     await showDialog<void>(
@@ -817,10 +801,13 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setDialogState) {
-            final allNames = [
-              ...PresetService.builtinPresets.keys,
+            final activeBuiltins = PresetService.builtinPresets.keys.where(
+              (k) => !_deletedBuiltinPresets.contains(k),
+            );
+            final allNames = <String>{
+              ...activeBuiltins,
               ..._userPresets.keys,
-            ];
+            }.toList();
             return AlertDialog(
               backgroundColor: const Color(0xFF242424),
               title: const Text(
@@ -883,7 +870,8 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                         itemBuilder: (ctx, i) {
                           final pName = allNames[i];
                           final isBuiltin =
-                              PresetService.builtinPresets.containsKey(pName);
+                              PresetService.builtinPresets.containsKey(pName) &&
+                              !_userPresets.containsKey(pName);
                           return Container(
                             margin: const EdgeInsets.only(bottom: 4),
                             padding: const EdgeInsets.symmetric(
@@ -928,23 +916,27 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                                     ),
                                   ),
                                 ),
-                                if (!isBuiltin)
-                                  IconButton(
-                                    icon: const Icon(
-                                      Icons.delete_outline,
-                                      size: 16,
-                                      color: Colors.redAccent,
-                                    ),
-                                    onPressed: () async {
-                                      await PresetService.deleteUserPreset(
-                                        pName,
-                                      );
-                                      final reloaded =
-                                          await PresetService.loadUserPresets();
-                                      setState(() => _userPresets = reloaded);
-                                      setDialogState(() {});
-                                    },
+                                IconButton(
+                                  tooltip: '프리셋 삭제',
+                                  icon: const Icon(
+                                    Icons.delete_outline,
+                                    size: 16,
+                                    color: Colors.redAccent,
                                   ),
+                                  onPressed: () async {
+                                    await PresetService.deletePreset(pName);
+                                    final reloaded =
+                                        await PresetService.loadUserPresets();
+                                    final deletedBuiltins =
+                                        await PresetService
+                                            .loadDeletedBuiltinPresets();
+                                    setState(() {
+                                      _userPresets = reloaded;
+                                      _deletedBuiltinPresets = deletedBuiltins;
+                                    });
+                                    setDialogState(() {});
+                                  },
+                                ),
                               ],
                             ),
                           );
@@ -1097,6 +1089,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             width: item.fullDecoded.width,
             height: item.fullDecoded.height,
             rgb: item.fullDecoded.rgb,
+            linearRgb: item.fullDecoded.linearRgb,
             paramsMap: paramsMap,
             format: format,
             quality: quality,
@@ -1186,7 +1179,6 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         },
       },
       child: Focus(
-        autofocus: true,
         child: DropTarget(
           onDragDone: (details) {
             final paths = details.files
@@ -1291,16 +1283,8 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     );
   }
 
-  /// SemiDarktable의 상단 헤더 툴바 1:1 이식 (단일 42px 수평 바 고정 — 버튼이 가로 100%로 늘어나는 버그 완전 수정)
+  /// 상단 헤더 툴바 (복사/붙여넣기/전체적용 및 외부 프리셋 드롭다운 제거, 프리셋 관리 버튼만 유지)
   Widget _buildTopActionToolbar() {
-    final allPresets = [
-      ...PresetService.builtinPresets.keys,
-      ..._userPresets.keys,
-    ];
-    final currentPresetVal = allPresets.contains(_selectedPresetName)
-        ? _selectedPresetName
-        : allPresets.first;
-
     return Container(
       height: 42,
       padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -1316,7 +1300,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.7',
+                '⚡ PhotonRaw v1.0.8',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -1338,55 +1322,8 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             ),
             const SizedBox(width: 10),
             _toolbarButton(
-              label: '📋 복사',
-              tooltip: '현재 현상 설정 복사',
-              onTap: _copySettings,
-            ),
-            const SizedBox(width: 6),
-            _toolbarButton(
-              label: '📌 붙여넣기',
-              tooltip: '복사한 현상 설정을 현재 사진에 붙여넣기',
-              onTap: _pasteSettings,
-            ),
-            const SizedBox(width: 6),
-            _toolbarButton(
-              label: '📌 전체 적용',
-              tooltip: '복사한 현상 설정을 로드된 모든 사진에 일괄 적용',
-              onTap: _pasteSettingsToAll,
-            ),
-            const SizedBox(width: 10),
-            Container(
-              height: 28,
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF181818),
-                borderRadius: BorderRadius.circular(4),
-                border: Border.all(color: const Color(0xFF3A3A3A)),
-              ),
-              child: DropdownButtonHideUnderline(
-                child: DropdownButton<String>(
-                  value: currentPresetVal,
-                  isDense: true,
-                  dropdownColor: const Color(0xFF262626),
-                  style: const TextStyle(fontSize: 11.5, color: Colors.white),
-                  items: allPresets
-                      .map(
-                        (k) => DropdownMenuItem<String>(
-                          value: k,
-                          child: Text(k),
-                        ),
-                      )
-                      .toList(),
-                  onChanged: (val) {
-                    if (val != null) _applyPresetByName(val);
-                  },
-                ),
-              ),
-            ),
-            const SizedBox(width: 6),
-            _toolbarButton(
               label: '⚙️ 프리셋 관리',
-              tooltip: '사용자 프리셋 저장/삭제 및 일괄 적용',
+              tooltip: '프리셋 적용, 저장 및 삭제',
               onTap: _showPresetManagerDialog,
             ),
             const SizedBox(width: 10),
@@ -1414,6 +1351,13 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                   );
                 }
               },
+            ),
+            const SizedBox(width: 6),
+            _toolbarButton(
+              label: '🌐 격자 표시',
+              tooltip: '삼등분 구도 및 수평 보조 격자 표시 토글 (단축키 G)',
+              active: _showGrid,
+              onTap: () => setState(() => _showGrid = !_showGrid),
             ),
             const SizedBox(width: 6),
             _toolbarButton(
@@ -1608,45 +1552,51 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                     ),
                   ),
                 ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                child: SizedBox(
-                  height: 28,
-                  child: TextField(
-                    controller: _searchController,
-                    style: const TextStyle(fontSize: 11.5),
-                    decoration: InputDecoration(
-                      hintText: '🔍 모듈 검색 (예: 노출, 커브, 화이트밸런스, 선명도...)',
-                      hintStyle: const TextStyle(
-                        fontSize: 11,
-                        color: Color(0xFF777777),
+              // 모바일(Android/iOS 또는 세로 1:1.7 이상 화면)에서는 모듈 검색 창을 표시하지 않음
+              if (!isTallPortrait &&
+                  !Platform.isAndroid &&
+                  !Platform.isIOS)
+                Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  child: SizedBox(
+                    height: 28,
+                    child: TextField(
+                      controller: _searchController,
+                      style: const TextStyle(fontSize: 11.5),
+                      decoration: InputDecoration(
+                        hintText: '🔍 모듈 검색 (예: 노출, 커브, 화이트밸런스, 선명도...)',
+                        hintStyle: const TextStyle(
+                          fontSize: 11,
+                          color: Color(0xFF777777),
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        filled: true,
+                        fillColor: const Color(0xFF161616),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(4),
+                          borderSide:
+                              const BorderSide(color: Color(0xFF333333)),
+                        ),
+                        suffixIcon: _moduleSearchQuery.isNotEmpty
+                            ? IconButton(
+                                padding: EdgeInsets.zero,
+                                icon: const Icon(Icons.clear, size: 14),
+                                onPressed: () {
+                                  _searchController.clear();
+                                  setState(() => _moduleSearchQuery = '');
+                                },
+                              )
+                            : null,
                       ),
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 4,
-                      ),
-                      filled: true,
-                      fillColor: const Color(0xFF161616),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(4),
-                        borderSide: const BorderSide(color: Color(0xFF333333)),
-                      ),
-                      suffixIcon: _moduleSearchQuery.isNotEmpty
-                          ? IconButton(
-                              padding: EdgeInsets.zero,
-                              icon: const Icon(Icons.clear, size: 14),
-                              onPressed: () {
-                                _searchController.clear();
-                                setState(() => _moduleSearchQuery = '');
-                              },
-                            )
-                          : null,
+                      onChanged: (v) =>
+                          setState(() => _moduleSearchQuery = v.trim()),
                     ),
-                    onChanged: (v) =>
-                        setState(() => _moduleSearchQuery = v.trim()),
                   ),
                 ),
-              ),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                 child: SizedBox(
@@ -1857,27 +1807,16 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeEnd: () => _triggerRender(fast: false),
             ),
             const SizedBox(height: 4),
-            Row(
-              children: [
-                Expanded(
-                  child: _smallBtn(
-                    _horizonMode ? '📏 수평선 그리는 중 (드래그)' : '📏 2점 수평선 그리기',
-                    () => setState(() {
-                      _horizonMode = !_horizonMode;
-                      if (_horizonMode) _cropEditMode = false;
-                    }),
-                    active: _horizonMode,
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: _smallBtn(
-                    '격자 표시 (G)',
-                    () => setState(() => _showGrid = !_showGrid),
-                    active: _showGrid,
-                  ),
-                ),
-              ],
+            SizedBox(
+              width: double.infinity,
+              child: _smallBtn(
+                _horizonMode ? '📏 수평선 그리는 중 (드래그)' : '📏 2점 수평선 그리기',
+                () => setState(() {
+                  _horizonMode = !_horizonMode;
+                  if (_horizonMode) _cropEditMode = false;
+                }),
+                active: _horizonMode,
+              ),
             ),
           ],
         ),

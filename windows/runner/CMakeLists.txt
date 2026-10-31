@@ -38,3 +38,13 @@ target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)
+
+# Copy LibRaw 16-bit RAW engine DLLs next to the executable
+add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/raw_r.dll"
+    "$<TARGET_FILE_DIR:${BINARY_NAME}>/raw_r.dll"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/vcomp140.dll"
+    "$<TARGET_FILE_DIR:${BINARY_NAME}>/vcomp140.dll"
+)

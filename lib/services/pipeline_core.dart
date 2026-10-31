@@ -12,12 +12,15 @@ class FloatImage {
   FloatImage(this.width, this.height, this.data);
 }
 
-/// sRGB 8-bit RGB 원본(프록시 또는 풀 해상도)
+/// 프록시 또는 풀 해상도 이미지 컨테이너
+/// - 14/16-bit RAW 및 16-bit TIFF의 경우 [linearRgb]에 무손실 32-bit Float 선형 데이터가 그대로 보관되어 절대 8비트로 다운스케일되지 않음
+/// - 일반 8-bit 이미지나 빠른 밝기 추정용으로 [rgb]도 함께 제공
 class ProxyImage {
   final int width;
   final int height;
   final Uint8List rgb;
-  ProxyImage(this.width, this.height, this.rgb);
+  final Float32List? linearRgb;
+  ProxyImage(this.width, this.height, this.rgb, [this.linearRgb]);
 }
 
 // ───────────────────────── 색 변환 상수 / LUT ─────────────────────────
@@ -62,8 +65,16 @@ double linearToSrgb(double c) {
   return _oetfLut[i] * (1.0 - t) + _oetfLut[i + 1] * t;
 }
 
-/// sRGB 8-bit → 선형 float
+/// 입력 이미지를 32-bit 선형 Float로 변환
+/// - 14/16-bit RAW 데이터([src.linearRgb]가 존재하는 경우)는 8비트 양자화를 절대 거치지 않고 순수 32-bit Float 버퍼 사본을 그대로 반환
 FloatImage srgb8ToLinear(ProxyImage src) {
+  if (src.linearRgb != null) {
+    return FloatImage(
+      src.width,
+      src.height,
+      Float32List.fromList(src.linearRgb!),
+    );
+  }
   final n = src.width * src.height * 3;
   final out = Float32List(n);
   final rgb = src.rgb;
@@ -71,6 +82,17 @@ FloatImage srgb8ToLinear(ProxyImage src) {
     out[i] = _srgbToLinearLut[rgb[i]];
   }
   return FloatImage(src.width, src.height, out);
+}
+
+/// 선형 float → 16-bit sRGB (16-bit Master TIFF 무손실 내보내기용)
+Uint16List toRgb16(FloatImage img) {
+  final n = img.width * img.height * 3;
+  final out = Uint16List(n);
+  final d = img.data;
+  for (var i = 0; i < n; i++) {
+    out[i] = (linearToSrgb(d[i]) * 65535.0 + 0.5).floor().clamp(0, 65535);
+  }
+  return out;
 }
 
 /// 선형 float → RGBA8 (표시용)
@@ -96,17 +118,6 @@ Uint8List toRgb8(FloatImage img) {
   final d = img.data;
   for (var i = 0; i < n; i++) {
     out[i] = (linearToSrgb(d[i]) * 255.0 + 0.5).floor();
-  }
-  return out;
-}
-
-/// 선형 float → RGB16 (16-bit 마스터 내보내기용)
-Uint16List toRgb16(FloatImage img) {
-  final n = img.width * img.height * 3;
-  final out = Uint16List(n);
-  final d = img.data;
-  for (var i = 0; i < n; i++) {
-    out[i] = (linearToSrgb(d[i]) * 65535.0 + 0.5).floor();
   }
   return out;
 }
