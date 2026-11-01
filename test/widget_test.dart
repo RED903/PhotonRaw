@@ -12,6 +12,70 @@ import 'package:photon_raw/widgets/color_equalizer_widget.dart';
 import 'package:photon_raw/widgets/tone_curve_widget.dart';
 
 void main() {
+  test('비네팅 -100 강한 효과·세부 슬라이더, 그레인/디노이즈 확장 파라미터 동작 검증', () {
+    const w = 120, h = 80;
+    final gray = Uint8List(w * h * 3)..fillRange(0, w * h * 3, 160);
+    final proxy = ProxyImage(w, h, gray);
+
+    int px(RenderOutput o, int x, int y) => o.rgba[(y * w + x) * 4];
+
+    // 비네팅 -100: 모서리가 중앙 대비 확실히 어두워야 함
+    final vg = PipelineParams()
+      ..vignetteEnabled = true
+      ..vgAmount = -1.0;
+    final vgOut = renderPreview(proxy, vg);
+    final center = px(vgOut, w ~/ 2, h ~/ 2);
+    final corner = px(vgOut, 1, 1);
+    expect(corner, lessThan(center * 0.3));
+
+    // Midpoint를 높이면 같은 위치(가장자리 안쪽)에서 덜 어두워짐
+    final vgLate = PipelineParams()
+      ..vignetteEnabled = true
+      ..vgAmount = -1.0
+      ..vgMidpoint = 1.0;
+    final lateOut = renderPreview(proxy, vgLate);
+    expect(px(lateOut, w ~/ 8, h ~/ 8), greaterThan(px(vgOut, w ~/ 8, h ~/ 8)));
+
+    // Roundness 변화 시 렌더링이 정상 동작
+    final vgRect = PipelineParams()
+      ..vignetteEnabled = true
+      ..vgAmount = -0.6
+      ..vgRoundness = -1.0;
+    expect(renderPreview(proxy, vgRect).rgba.length, w * h * 4);
+
+    // 그레인: 크기/거칠기 변경에 따라 결과가 달라지고 크래시 없음
+    final grA = PipelineParams()
+      ..grainEnabled = true
+      ..grAmount = 0.8
+      ..grSize = 0.0
+      ..grRoughness = 1.0;
+    final grB = PipelineParams()
+      ..grainEnabled = true
+      ..grAmount = 0.8
+      ..grSize = 1.0
+      ..grRoughness = 0.0;
+    final a = renderPreview(proxy, grA).rgba;
+    final b = renderPreview(proxy, grB).rgba;
+    var diff = 0;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) diff++;
+    }
+    expect(diff, greaterThan(100));
+
+    // 디노이즈: 휘도/색 노이즈 슬라이더 동작
+    final dn = PipelineParams()
+      ..denoiseEnabled = true
+      ..dnStrength = 0.8
+      ..dnColor = 0.8
+      ..dnDetail = 0.5;
+    expect(renderPreview(proxy, dn).rgba.length, w * h * 4);
+
+    // 직렬화 왕복
+    final restored = PipelineParams.fromMap(vgRect.toMap());
+    expect(restored.vgRoundness, closeTo(-1.0, 1e-9));
+    expect(PipelineParams.fromMap(grA.toMap()).grSize, closeTo(0.0, 1e-9));
+    expect(PipelineParams.fromMap(dn.toMap()).dnColor, closeTo(0.8, 1e-9));
+  });
   test('스팟 소스 탐색: 스트로크 길이를 고려해 타겟과 겹치지 않는 위치 선택 + 경계 부드러움', () {
     const w = 200, h = 150;
     // 좌->우 완만한 그라디언트 배경 + 타겟 위치에 어두운 잡티
@@ -254,7 +318,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1440, 900));
     await tester.pumpWidget(const PhotonRawApp());
-    expect(find.text('⚡ PhotonRaw v1.0.10'), findsOneWidget);
+    expect(find.text('⚡ PhotonRaw v1.0.11'), findsOneWidget);
     expect(find.text('사진 또는 RAW 파일을 불러오세요'), findsOneWidget);
 
     // 0. 상단 바에서 '📋 복사', '📌 붙여넣기', '📌 전체 적용' 및 외부 프리셋 드롭다운이 제거되고 '⚙️ 프리셋 관리'와 '🌐 격자 표시'가 상단에 있는지 검증

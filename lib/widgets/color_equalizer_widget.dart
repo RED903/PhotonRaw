@@ -1,5 +1,6 @@
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'double_tap_tracker.dart';
 
 /// 8개 밴드 노드(32px) 또는 이퀄라이저 스플라인 곡선(26px) 근처를 터치했을 때만
 /// 즉시 GestureArena에서 승리하여 부모 ListView의 수직 스크롤을 차단하고,
@@ -69,8 +70,7 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
   // SemiDarktable 기본 시작 모드: 'hue' ('hue', 'sat', 'bri')
   late String _internalMode;
   int? _selectedBand;
-  DateTime? _lastTapTime;
-  Offset? _lastTapPos;
+  final DoubleTapTracker _doubleTap = DoubleTapTracker();
 
   @override
   bool get wantKeepAlive => true;
@@ -229,19 +229,9 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
     double width,
     double height,
   ) {
-    final now = DateTime.now();
-    final pos = event.localPosition;
-    if (_lastTapTime != null &&
-        _lastTapPos != null &&
-        now.difference(_lastTapTime!) < const Duration(milliseconds: 320) &&
-        (pos - _lastTapPos!).distance < 32.0) {
-      _lastTapTime = null;
-      _lastTapPos = null;
-      _handleDoubleTapAt(pos, width, height);
-      return;
+    if (_doubleTap.onPointerDown(event)) {
+      _handleDoubleTapAt(event.localPosition, width, height);
     }
-    _lastTapTime = now;
-    _lastTapPos = pos;
   }
 
   void _handleDoubleTapAt(Offset localPos, double width, double height) {
@@ -341,6 +331,9 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
             return Listener(
               behavior: HitTestBehavior.opaque,
               onPointerDown: (e) => _handlePointerDownForDoubleTap(e, w, h),
+              onPointerMove: _doubleTap.onPointerMove,
+              onPointerUp: _doubleTap.onPointerUp,
+              onPointerCancel: _doubleTap.onPointerCancel,
               child: RawGestureDetector(
                 behavior: HitTestBehavior.opaque,
                 gestures: <Type, GestureRecognizerFactory>{

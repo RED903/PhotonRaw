@@ -46,7 +46,7 @@ class PhotonRawApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PhotonRaw v1.0.10 — Pro RAW & Photo Darkroom',
+      title: 'PhotonRaw v1.0.11 — Pro RAW & Photo Darkroom',
       debugShowCheckedModeBanner: false,
       // Windows flutter_windows.dll(0x3c1ca) AccessibilityBridge AXTree 크래시 원천 차단을 위해 Semantics 트리 비활성화
       builder: (context, child) => ExcludeSemantics(
@@ -302,7 +302,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   Timer? _qualityDebounceTimer;
 
   bool _isLoadingFile = false;
-  String _statusMessage = '준비 완료 (v1.0.10) — 사진 또는 RAW 파일을 열어주세요';
+  String _statusMessage = '준비 완료 (v1.0.11) — 사진 또는 RAW 파일을 열어주세요';
 
   // 우측 모듈 필터 및 검색 상태 (SemiDarktable 6개 카테고리 탭과 동일)
   String _activeCategory = 'all'; // 'all', 'active', 'tone', 'color', 'geometry', 'detail'
@@ -1355,7 +1355,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.10',
+                '⚡ PhotonRaw v1.0.11',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -3070,13 +3070,15 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             (params) {
               params.denoiseEnabled = false;
               params.dnStrength = 0.0;
+              params.dnColor = 0.0;
+              params.dnDetail = 0.5;
             },
             recordUndo: true,
             fast: false,
           ),
           children: [
             ControlSlider(
-              label: '노이즈 억제 강도 (Strength)',
+              label: '휘도 노이즈 억제 (Luminance)',
               value: p.dnStrength,
               min: 0.0,
               max: 100.0,
@@ -3087,6 +3089,32 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.denoiseEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.dnStrength = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '색 노이즈 억제 (Color)',
+              value: p.dnColor,
+              min: 0.0,
+              max: 100.0,
+              defaultVal: 0.0,
+              scale: 0.01,
+              decimals: 1,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.denoiseEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.dnColor = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '디테일 보존 (Detail)',
+              value: p.dnDetail,
+              min: 0.0,
+              max: 100.0,
+              defaultVal: 50.0,
+              scale: 0.01,
+              decimals: 1,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.denoiseEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.dnDetail = v),
               onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
@@ -3335,6 +3363,8 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             (params) {
               params.grainEnabled = false;
               params.grAmount = 0.0;
+              params.grSize = 0.25;
+              params.grRoughness = 0.5;
             },
             recordUndo: true,
             fast: false,
@@ -3351,6 +3381,33 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.grainEnabled = true,
               onChanged: (v) => _updateParams((params) => params.grAmount = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '입자 크기 (Size)',
+              value: p.grSize,
+              min: 0.0,
+              max: 100.0,
+              defaultVal: 25.0,
+              scale: 0.01,
+              decimals: 1,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.grainEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.grSize = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '거칠기 (Roughness)',
+              value: p.grRoughness,
+              min: 0.0,
+              max: 100.0,
+              defaultVal: 50.0,
+              scale: 0.01,
+              decimals: 1,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.grainEnabled = true,
+              onChanged: (v) =>
+                  _updateParams((params) => params.grRoughness = v),
               onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
@@ -3379,6 +3436,10 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             (params) {
               params.vignetteEnabled = false;
               params.vgAmount = 0.0;
+              params.vgMidpoint = 0.5;
+              params.vgFeather = 0.5;
+              params.vgRoundness = 0.0;
+              params.vgHighlights = 0.0;
             },
             recordUndo: true,
             fast: false,
@@ -3395,6 +3456,62 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.vignetteEnabled = true,
               onChanged: (v) => _updateParams((params) => params.vgAmount = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '중간 지점 (Midpoint)',
+              value: p.vgMidpoint,
+              min: 0.0,
+              max: 100.0,
+              defaultVal: 50.0,
+              scale: 0.01,
+              decimals: 1,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.vignetteEnabled = true,
+              onChanged: (v) =>
+                  _updateParams((params) => params.vgMidpoint = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '부드러움 (Feather)',
+              value: p.vgFeather,
+              min: 0.0,
+              max: 100.0,
+              defaultVal: 50.0,
+              scale: 0.01,
+              decimals: 1,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.vignetteEnabled = true,
+              onChanged: (v) =>
+                  _updateParams((params) => params.vgFeather = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '둥글기 (Roundness: - 사각 ↔ + 원형)',
+              value: p.vgRoundness,
+              min: -100.0,
+              max: 100.0,
+              defaultVal: 0.0,
+              scale: 0.01,
+              decimals: 1,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.vignetteEnabled = true,
+              onChanged: (v) =>
+                  _updateParams((params) => params.vgRoundness = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '하이라이트 보호 (Highlights)',
+              value: p.vgHighlights,
+              min: 0.0,
+              max: 100.0,
+              defaultVal: 0.0,
+              scale: 0.01,
+              decimals: 1,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.vignetteEnabled = true,
+              onChanged: (v) =>
+                  _updateParams((params) => params.vgHighlights = v),
               onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],

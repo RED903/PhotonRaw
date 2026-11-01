@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'double_tap_tracker.dart';
 
 /// SemiDarktable의 SliderSpinRow 1:1 이식 위젯
 /// - 라벨 + 직접 수치 입력/스핀 박스 + 슬라이더
@@ -45,8 +46,8 @@ class _ControlSliderState extends State<ControlSlider> {
   late TextEditingController _textController;
   final FocusNode _textFocusNode = FocusNode();
 
-  DateTime? _lastPointerDownTime;
-  Offset? _lastPointerDownPos;
+  final DoubleTapTracker _doubleTap = DoubleTapTracker();
+  bool _ignoreSliderChanges = false;
 
   double get _uiValue => (widget.value / widget.scale).clamp(widget.min, widget.max);
 
@@ -89,30 +90,32 @@ class _ControlSliderState extends State<ControlSlider> {
     widget.onChangeEnd?.call();
   }
 
-  /// Slider 내부 제스처 인식기에 가로채이지 않도록 PointerDown 단계에서 직접 더블클릭 감지
+  /// Slider 내부 제스처 인식기에 가로채이지 않도록 PointerDown 단계에서 직접 더블탭 감지
+  /// (모바일에서 정확히 같은 위치를 누르기 어려우므로 허용 거리·시간을 넉넉하게 설정)
   void _handleSliderPointerDown(PointerDownEvent event) {
-    if (event.buttons != 0 && (event.buttons & 1) == 0) return;
-    final now = DateTime.now();
-    final pos = event.localPosition;
-    if (_lastPointerDownTime != null &&
-        _lastPointerDownPos != null &&
-        now.difference(_lastPointerDownTime!) <
-            const Duration(milliseconds: 350) &&
-        (pos - _lastPointerDownPos!).distance < 36.0) {
-      _lastPointerDownTime = null;
-      _lastPointerDownPos = null;
+    if (_doubleTap.onPointerDown(event)) {
+      // 두 번째 터치 동안 Slider가 값을 덮어쓰지 못하도록 막고 기본값으로 초기화
+      _ignoreSliderChanges = true;
       _resetToDefault();
-      // Slider의 첫 클릭 위치 이동을 덮어쓰기 위해 다음 마이크로태스크에서도 기본값 보장
-      Future.microtask(() {
-        if (mounted) {
-          widget.onChanged(widget.defaultVal * widget.scale);
-          widget.onChangeEnd?.call();
-        }
-      });
-      return;
     }
-    _lastPointerDownTime = now;
-    _lastPointerDownPos = pos;
+  }
+
+  void _handleSliderPointerUp(PointerUpEvent event) {
+    _doubleTap.onPointerUp(event);
+    _releaseSliderGuard();
+  }
+
+  void _handleSliderPointerCancel(PointerCancelEvent event) {
+    _doubleTap.onPointerCancel(event);
+    _releaseSliderGuard();
+  }
+
+  /// 손을 뗀 직후 Slider가 뒤늦게 보내는 변경 이벤트까지 막은 뒤 가드 해제
+  void _releaseSliderGuard() {
+    if (!_ignoreSliderChanges) return;
+    Future.delayed(const Duration(milliseconds: 150), () {
+      _ignoreSliderChanges = false;
+    });
   }
 
   void _commitText(String raw) {
@@ -246,6 +249,9 @@ class _ControlSliderState extends State<ControlSlider> {
           Listener(
             behavior: HitTestBehavior.translucent,
             onPointerDown: _handleSliderPointerDown,
+            onPointerMove: _doubleTap.onPointerMove,
+            onPointerUp: _handleSliderPointerUp,
+            onPointerCancel: _handleSliderPointerCancel,
             child: SliderTheme(
               data: SliderTheme.of(context).copyWith(
                 trackHeight: 3.0,
@@ -267,13 +273,16 @@ class _ControlSliderState extends State<ControlSlider> {
                 min: widget.min,
                 max: widget.max,
                 onChangeStart: (_) {
+                  if (_ignoreSliderChanges) return;
                   widget.onChangeStart?.call();
                   widget.onAutoTurnOn?.call();
                 },
                 onChanged: (uiVal) {
+                  if (_ignoreSliderChanges) return;
                   widget.onChanged(uiVal * widget.scale);
                 },
                 onChangeEnd: (_) {
+                  if (_ignoreSliderChanges) return;
                   widget.onChangeEnd?.call();
                 },
               ),

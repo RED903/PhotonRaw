@@ -862,7 +862,7 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
   final shOn = p.sharpenEnabled && p.shAmount > 0;
   final lcOn = p.localContrastEnabled &&
       (p.lcDetail.abs() > 0.001 || p.lcClarity.abs() > 0.001);
-  final dnOn = p.denoiseEnabled && p.dnStrength > 0;
+  final dnOn = p.denoiseEnabled && (p.dnStrength > 0 || p.dnColor > 0);
   final blOn = p.blurEnabled && p.blurRadius > 0;
   final grOn = p.grainEnabled && p.grAmount > 0;
   final vgOn = p.vignetteEnabled && p.vgAmount != 0;
@@ -929,11 +929,52 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
   }
 
   if (dnOn) {
-    final blur = boxBlur(img, w, h, 2);
-    final a = p.dnStrength * 0.6;
+    // 휘도 노이즈: 엣지 보존 블렌딩 (윤곽선이 큰 픽셀은 원본 유지, 평탄한 영역만 평활화)
+    // 색 노이즈: 넓은 반경 블러의 크로마(색 성분)만 섞어 밝기 디테일은 보존
+    final blurL = p.dnStrength > 0 ? boxBlur(img, w, h, 2) : null;
+    final blurC = p.dnColor > 0 ? boxBlur(img, w, h, 4) : null;
+    final lumAmt = (p.dnStrength * 0.95).clamp(0.0, 1.0);
+    final colAmt = p.dnColor.clamp(0.0, 1.0);
+    // dnDetail이 높을수록 엣지 임계값이 작아져 더 많은 디테일이 보존됨
+    final edgeTh = 0.02 + 0.22 * (1.0 - p.dnDetail.clamp(0.0, 1.0));
     final o = Float32List(n);
-    for (var i = 0; i < n; i++) {
-      o[i] = img[i] * (1.0 - a) + blur[i] * a;
+    final pc = w * h;
+    for (var pi = 0; pi < pc; pi++) {
+      final i = pi * 3;
+      var r = img[i].toDouble();
+      var g = img[i + 1].toDouble();
+      var b = img[i + 2].toDouble();
+
+      if (blurL != null) {
+        final br = blurL[i].toDouble();
+        final bg = blurL[i + 1].toDouble();
+        final bb = blurL[i + 2].toDouble();
+        final l0 = math.sqrt(math.max(0.0, 0.2126 * r + 0.7152 * g + 0.0722 * b));
+        final l1 = math.sqrt(math.max(0.0, 0.2126 * br + 0.7152 * bg + 0.0722 * bb));
+        final diff = (l0 - l1).abs();
+        var keep = (diff / edgeTh).clamp(0.0, 1.0).toDouble();
+        keep = keep * keep * (3.0 - 2.0 * keep);
+        final a = lumAmt * (1.0 - keep);
+        r = r * (1.0 - a) + br * a;
+        g = g * (1.0 - a) + bg * a;
+        b = b * (1.0 - a) + bb * a;
+      }
+
+      if (blurC != null) {
+        final cr = blurC[i].toDouble();
+        final cg = blurC[i + 1].toDouble();
+        final cb = blurC[i + 2].toDouble();
+        final lumO = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        final lumB = 0.2126 * cr + 0.7152 * cg + 0.0722 * cb;
+        // 현재 밝기는 유지하고 크로마 성분만 블러 값으로 교체
+        r = lumO + ((r - lumO) * (1.0 - colAmt) + (cr - lumB) * colAmt);
+        g = lumO + ((g - lumO) * (1.0 - colAmt) + (cg - lumB) * colAmt);
+        b = lumO + ((b - lumO) * (1.0 - colAmt) + (cb - lumB) * colAmt);
+      }
+
+      o[i] = r;
+      o[i + 1] = g;
+      o[i + 2] = b;
     }
     img = o;
   }
@@ -952,6 +993,19 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
   if (grOn || vgOn) {
     final o = Float32List.fromList(img);
     final aspect = w / math.max(1, h);
+    final maxDim = math.max(w, h).toDouble();
+
+    // 그레인: 입자 크기는 해상도에 비례(프리뷰/내보내기에서 같은 모양), 거칠기는 부드러운 덩어리↔날카로운 입자 혼합
+    final grCell = math.max(1.0, p.grSize.clamp(0.0, 1.0) * maxDim * 0.004 + 1.0);
+    final grRough = p.grRoughness.clamp(0.0, 1.0);
+
+    // 비네팅 형태/세기 파라미터
+    final vgInner = 0.12 + 0.75 * p.vgMidpoint.clamp(0.0, 1.0);
+    final vgWidth = 0.12 + 0.95 * p.vgFeather.clamp(0.0, 1.0);
+    final vgRound = p.vgRoundness.clamp(-1.0, 1.0);
+    final vgHalfDiag = math.sqrt(aspect * aspect + 1.0);
+    final vgHl = p.vgHighlights.clamp(0.0, 1.0);
+
     for (var y = 0; y < h; y++) {
       for (var x = 0; x < w; x++) {
         final idx = (y * w + x) * 3;
@@ -960,24 +1014,65 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
         var b = o[idx + 2].toDouble();
 
         if (grOn) {
-          final noise = (_rand(x.toDouble(), y.toDouble()) - 0.5) * p.grAmount * 0.35;
+          // 격자 보간 값 노이즈(부드러운 입자)와 픽셀 단위 화이트 노이즈를 거칠기로 혼합
+          final gx = x / grCell;
+          final gy = y / grCell;
+          final ix = gx.floor();
+          final iy = gy.floor();
+          final fx = gx - ix;
+          final fy = gy - iy;
+          final sx = fx * fx * (3.0 - 2.0 * fx);
+          final sy = fy * fy * (3.0 - 2.0 * fy);
+          final n00 = _rand(ix.toDouble(), iy.toDouble());
+          final n10 = _rand(ix + 1.0, iy.toDouble());
+          final n01 = _rand(ix.toDouble(), iy + 1.0);
+          final n11 = _rand(ix + 1.0, iy + 1.0);
+          final smooth = (n00 * (1 - sx) + n10 * sx) * (1 - sy) +
+              (n01 * (1 - sx) + n11 * sx) * sy;
+          final white = _rand(x.toDouble() + 0.37, y.toDouble() + 0.73);
+          final nz = (smooth * (1.0 - grRough) + white * grRough) - 0.5;
+          // 중간톤에서 가장 눈에 띄도록 밝기 가중
+          final lumS = math.sqrt(
+            (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0),
+          );
+          final mw = 0.45 + 0.55 * (4.0 * lumS * (1.0 - lumS));
+          final noise = nz * p.grAmount * 0.9 * mw * (1.0 + 0.8 * (1.0 - grRough));
           r += noise;
           g += noise;
           b += noise;
         }
 
         if (vgOn) {
-          final dx = ((x + 0.5) / w - 0.5) * aspect;
-          final dy = (y + 0.5) / h - 0.5;
-          final len2 = dx * dx + dy * dy;
-          if (p.vgAmount < 0) {
-            final vig = (1.0 - len2 * (-p.vgAmount * 0.8)).clamp(0.0, 1.0).toDouble();
-            r *= vig;
-            g *= vig;
-            b *= vig;
+          final dx = ((x + 0.5) / w - 0.5) * 2.0;
+          final dy = ((y + 0.5) / h - 0.5) * 2.0;
+          // 타원(이미지 비율), 원, 직사각형 거리를 Roundness로 혼합 (모서리가 대략 1.0)
+          final dEllipse = math.sqrt(dx * dx + dy * dy) / math.sqrt2;
+          double d;
+          if (vgRound >= 0.0) {
+            final ddx = dx * aspect;
+            final dCircle = math.sqrt(ddx * ddx + dy * dy) / vgHalfDiag;
+            d = dEllipse * (1.0 - vgRound) + dCircle * vgRound;
           } else {
-            final vig = (len2 * (p.vgAmount * 0.8)).clamp(0.0, 1.0).toDouble();
-            final a = vig * 0.75;
+            final dRect = math.max(dx.abs(), dy.abs());
+            d = dEllipse * (1.0 + vgRound) + dRect * (-vgRound);
+          }
+          var t = ((d - vgInner) / vgWidth).clamp(0.0, 1.0).toDouble();
+          t = t * t * (3.0 - 2.0 * t);
+
+          if (p.vgAmount < 0) {
+            // 노출(EV) 단위로 어둡게: -100에서 모서리가 최대 약 -4.5EV (선형 광량 기준)
+            var gain = math.pow(2.0, p.vgAmount * t * 4.5).toDouble();
+            if (vgHl > 0) {
+              // 하이라이트 보호: 밝은 픽셀일수록 어두워지는 정도를 줄임
+              final lum = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+              final protect = vgHl * lum * lum;
+              gain = gain + (1.0 - gain) * protect;
+            }
+            r *= gain;
+            g *= gain;
+            b *= gain;
+          } else {
+            final a = (t * p.vgAmount * 0.95).clamp(0.0, 1.0).toDouble();
             r = r + (1.0 - r) * a;
             g = g + (1.0 - g) * a;
             b = b + (1.0 - b) * a;

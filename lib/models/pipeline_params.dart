@@ -192,16 +192,24 @@ class PipelineParams {
   double lcClarity = 0.0;
 
   bool denoiseEnabled = false;
-  double dnStrength = 0.0;
+  double dnStrength = 0.0; // 휘도(밝기) 노이즈 억제 강도
+  double dnColor = 0.0; // 색(크로마) 노이즈 억제 강도
+  double dnDetail = 0.5; // 디테일/엣지 보존 정도 (높을수록 윤곽 보존)
 
   bool blurEnabled = false;
   double blurRadius = 0.0;
 
   bool grainEnabled = false;
-  double grAmount = 0.0;
+  double grAmount = 0.0; // 입자 강도
+  double grSize = 0.25; // 입자 크기
+  double grRoughness = 0.5; // 거칠기 (낮음: 부드러운 덩어리, 높음: 날카로운 입자)
 
   bool vignetteEnabled = false;
-  double vgAmount = 0.0;
+  double vgAmount = 0.0; // -1(어둡게) ~ +1(밝게)
+  double vgMidpoint = 0.5; // 비네팅이 시작되는 지점 (높을수록 가장자리에만 적용)
+  double vgFeather = 0.5; // 경계 부드러움
+  double vgRoundness = 0.0; // -1(직사각형) ~ +1(원형)
+  double vgHighlights = 0.0; // 어둡게 할 때 하이라이트 보호 정도
 
   // 디헤이즈 / 디프린지 / 스팟
   bool dehazeEnabled = false;
@@ -281,12 +289,20 @@ class PipelineParams {
         'lc_clarity': lcClarity,
         'denoise_enabled': denoiseEnabled,
         'dn_strength': dnStrength,
+        'dn_color': dnColor,
+        'dn_detail': dnDetail,
         'blur_enabled': blurEnabled,
         'blur_radius': blurRadius,
         'grain_enabled': grainEnabled,
         'gr_amount': grAmount,
+        'gr_size': grSize,
+        'gr_roughness': grRoughness,
         'vignette_enabled': vignetteEnabled,
         'vg_amount': vgAmount,
+        'vg_midpoint': vgMidpoint,
+        'vg_feather': vgFeather,
+        'vg_roundness': vgRoundness,
+        'vg_highlights': vgHighlights,
         'dehaze_enabled': dehazeEnabled,
         'dh_strength': dhStrength,
         'defringe_enabled': defringeEnabled,
@@ -386,12 +402,20 @@ class PipelineParams {
     if (m.containsKey('lc_clarity')) lcClarity = _d(m['lc_clarity'], lcClarity);
     if (m.containsKey('denoise_enabled')) denoiseEnabled = _b(m['denoise_enabled'], denoiseEnabled);
     if (m.containsKey('dn_strength')) dnStrength = _d(m['dn_strength'], dnStrength);
+    if (m.containsKey('dn_color')) dnColor = _d(m['dn_color'], dnColor);
+    if (m.containsKey('dn_detail')) dnDetail = _d(m['dn_detail'], dnDetail);
     if (m.containsKey('blur_enabled')) blurEnabled = _b(m['blur_enabled'], blurEnabled);
     if (m.containsKey('blur_radius')) blurRadius = _d(m['blur_radius'], blurRadius);
     if (m.containsKey('grain_enabled')) grainEnabled = _b(m['grain_enabled'], grainEnabled);
     if (m.containsKey('gr_amount')) grAmount = _d(m['gr_amount'], grAmount);
+    if (m.containsKey('gr_size')) grSize = _d(m['gr_size'], grSize);
+    if (m.containsKey('gr_roughness')) grRoughness = _d(m['gr_roughness'], grRoughness);
     if (m.containsKey('vignette_enabled')) vignetteEnabled = _b(m['vignette_enabled'], vignetteEnabled);
     if (m.containsKey('vg_amount')) vgAmount = _d(m['vg_amount'], vgAmount);
+    if (m.containsKey('vg_midpoint')) vgMidpoint = _d(m['vg_midpoint'], vgMidpoint);
+    if (m.containsKey('vg_feather')) vgFeather = _d(m['vg_feather'], vgFeather);
+    if (m.containsKey('vg_roundness')) vgRoundness = _d(m['vg_roundness'], vgRoundness);
+    if (m.containsKey('vg_highlights')) vgHighlights = _d(m['vg_highlights'], vgHighlights);
     if (m.containsKey('dehaze_enabled')) dehazeEnabled = _b(m['dehaze_enabled'], dehazeEnabled);
     if (m.containsKey('dh_strength')) dhStrength = _d(m['dh_strength'], dhStrength);
     if (m.containsKey('defringe_enabled')) defringeEnabled = _b(m['defringe_enabled'], defringeEnabled);

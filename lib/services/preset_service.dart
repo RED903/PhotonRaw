@@ -47,7 +47,7 @@ class PresetService {
       'grain_enabled': true,
       'gr_amount': 0.18,
       'vignette_enabled': true,
-      'vg_amount': -0.35,
+      'vg_amount': -0.10,
     },
     '🎬 Cinematic Moody (시네마틱)': {
       'exposure_enabled': true,
@@ -65,7 +65,7 @@ class PresetService {
       'sat_global': -0.20,
       'sat_vibrance': 0.10,
       'vignette_enabled': true,
-      'vg_amount': -0.5,
+      'vg_amount': -0.14,
       'grain_enabled': true,
       'gr_amount': 0.14,
     },
@@ -88,7 +88,7 @@ class PresetService {
       'grain_enabled': true,
       'gr_amount': 0.22,
       'vignette_enabled': true,
-      'vg_amount': -0.45,
+      'vg_amount': -0.12,
     },
   };
 

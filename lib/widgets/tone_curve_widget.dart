@@ -1,7 +1,9 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import '../services/curve_lut.dart';
+import 'double_tap_tracker.dart';
 
 /// 점 또는 곡선 근처를 터치했을 때만 즉시 GestureArena에서 승리하여
 /// 부모 ListView의 수직 스크롤을 막고, 빈 배경 영역을 터치했을 때는
@@ -55,15 +57,23 @@ class ToneCurveWidget extends StatefulWidget {
 class _ToneCurveWidgetState extends State<ToneCurveWidget>
     with AutomaticKeepAliveClientMixin {
   static const double _pad = 12.0;
-  // 기존에 생성된 점을 쉽게 잡을 수 있도록 히트 반경을 30px(지름 60px)로 확대
-  static const double _pointHitRadius = 30.0;
-  // 곡선 라인 근처 터치 인식 반경 (26px) — 이 범위 밖의 빈 영역은 스크롤 허용
-  static const double _curveLineHitRadius = 26.0;
+  // 중간 제어점은 손가락으로 잡기 쉽도록 반경을 넉넉하게(40px) 설정
+  static const double _pointHitRadius = 40.0;
+  // 양 끝점은 중간 점 조작을 방해하지 않도록 더 작은 반경(24px)에서만 잡힘
+  static const double _endPointHitRadius = 24.0;
+  // 곡선 라인 근처 터치 인식 반경 — 이 범위 밖의 빈 영역은 스크롤 허용
+  static const double _curveLineHitRadius = 38.0;
 
   String _activeChannel = 'rgb';
   int? _draggingIndex;
-  DateTime? _lastTapTime;
-  Offset? _lastTapPos;
+  // 터치 시작 위치(드래그 시작 후 이동량에 의한 오차 없이 정확한 점 판정에 사용)
+  Offset? _downPos;
+  // 점을 잡은 위치와 점 중심의 차이(정규화 좌표) — 잡는 순간 점이 튀지 않도록 보정
+  Offset _grabOffset = Offset.zero;
+  final DoubleTapTracker _doubleTap = DoubleTapTracker(
+    maxInterval: Duration(milliseconds: 450),
+    maxDistance: 44.0,
+  );
 
   @override
   bool get wantKeepAlive => true;
@@ -92,27 +102,41 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     return map;
   }
 
+  /// 터치 위치에서 잡을 제어점 선택.
+  /// 중간 점을 항상 우선하며, 중간 점이 반경 안에 없을 때만 양 끝점을 후보로 사용한다.
   int? _findNearPoint(
     Offset localPos,
     Size size,
     List<List<double>> pts, {
-    double hitRadius = _pointHitRadius,
+    double? hitRadius,
   }) {
     final w = (size.width - _pad * 2).clamp(1.0, 10000.0);
     final h = (size.height - _pad * 2).clamp(1.0, 10000.0);
+    final midR = hitRadius ?? _pointHitRadius;
+    final endR = hitRadius != null
+        ? math.min(hitRadius, _endPointHitRadius)
+        : _endPointHitRadius;
 
-    int? bestIdx;
-    double bestDist = hitRadius;
+    int? bestMid;
+    double bestMidDist = midR;
+    int? bestEnd;
+    double bestEndDist = endR;
     for (int i = 0; i < pts.length; i++) {
       final px = _pad + pts[i][0] * w;
       final py = _pad + (1.0 - pts[i][1]) * h;
       final d = (Offset(px, py) - localPos).distance;
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = i;
+      final isEnd = i == 0 || i == pts.length - 1;
+      if (isEnd) {
+        if (d < bestEndDist) {
+          bestEndDist = d;
+          bestEnd = i;
+        }
+      } else if (d < bestMidDist) {
+        bestMidDist = d;
+        bestMid = i;
       }
     }
-    return bestIdx;
+    return bestMid ?? bestEnd;
   }
 
   /// 터치 위치에서 현재 활성 채널 스플라인 곡선까지의 최소 거리(px) 계산
@@ -137,7 +161,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     return minDist;
   }
 
-  /// 제어점(30px) 또는 곡선 라인(26px) 근처인지 판별
+  /// 제어점 또는 곡선 라인 근처인지 판별
   bool _isInteractiveTouch(Offset localPos, Size size) {
     final pts = _currentPoints;
     if (_findNearPoint(localPos, size, pts) != null) {
@@ -154,47 +178,45 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     return Offset(nx, ny);
   }
 
-  void _handlePointerDownForDoubleTap(PointerDownEvent event, Size size) {
-    final now = DateTime.now();
-    final pos = event.localPosition;
-    if (_lastTapTime != null &&
-        _lastTapPos != null &&
-        now.difference(_lastTapTime!) < const Duration(milliseconds: 320) &&
-        (pos - _lastTapPos!).distance < 32.0) {
-      _lastTapTime = null;
-      _lastTapPos = null;
+  void _handlePointerDown(PointerDownEvent event, Size size) {
+    _downPos = event.localPosition;
+    if (_doubleTap.onPointerDown(event)) {
       _draggingIndex = null;
-      _handleDoubleTapAt(pos, size);
-      return;
+      _handleDoubleTapAt(event.localPosition, size);
     }
-    _lastTapTime = now;
-    _lastTapPos = pos;
   }
 
   void _handlePanStart(DragStartDetails details, Size size) {
     final pts = _currentPoints;
-    // 1순위: 확대된 반경(30px) 내의 기존 제어점 우선 선택
-    int? hit = _findNearPoint(details.localPosition, size, pts);
+    // 드래그 인식 후 이동한 위치가 아니라 실제 터치를 시작한 위치로 판정
+    final pos = _downPos ?? details.localPosition;
+    final norm = _posToNorm(pos, size);
 
-    // 2순위: 기존 중간 제어점과 X좌표가 매우 가까운 경우(4.5% 이내) 새 점을 만들지 않고 기존 점을 잡음
-    final norm = _posToNorm(details.localPosition, size);
+    // 1순위: 확대된 반경 내의 중간 제어점 → 2순위: 양 끝점(작은 반경)
+    int? hit = _findNearPoint(pos, size, pts);
+
+    // 3순위: 중간 제어점과 X좌표가 가까운 경우(5% 이내) 새 점을 만들지 않고 기존 점을 잡음
     if (hit == null) {
+      int? bestIdx;
+      double bestDx = 0.05;
       for (int i = 1; i < pts.length - 1; i++) {
-        if ((pts[i][0] - norm.dx).abs() < 0.045 &&
-            (pts[i][1] - norm.dy).abs() < 0.16) {
-          hit = i;
-          break;
+        final dx = (pts[i][0] - norm.dx).abs();
+        if (dx < bestDx && (pts[i][1] - norm.dy).abs() < 0.2) {
+          bestDx = dx;
+          bestIdx = i;
         }
       }
+      hit = bestIdx;
     }
 
     widget.onChangeStart?.call();
     widget.onAutoTurnOn?.call();
 
     if (hit != null) {
+      _grabOffset = Offset(pts[hit][0] - norm.dx, pts[hit][1] - norm.dy);
       setState(() => _draggingIndex = hit);
-    } else if (_distanceToCurve(details.localPosition, size, pts) <=
-        _curveLineHitRadius) {
+    } else if (_distanceToCurve(pos, size, pts) <= _curveLineHitRadius) {
+      _grabOffset = Offset.zero;
       pts.add([norm.dx, norm.dy]);
       pts.sort((a, b) => a[0].compareTo(b[0]));
       int newIdx = 0;
@@ -220,8 +242,9 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     if (idx < 0 || idx >= pts.length) return;
 
     final norm = _posToNorm(details.localPosition, size);
-    double nx = norm.dx;
-    final ny = norm.dy;
+    // 잡았을 때의 차이를 유지해 점이 손가락 위치로 순간이동하지 않게 함
+    double nx = (norm.dx + _grabOffset.dx).clamp(0.0, 1.0);
+    final ny = (norm.dy + _grabOffset.dy).clamp(0.0, 1.0);
 
     if (idx == 0) {
       nx = 0.0;
@@ -377,7 +400,10 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
 
             return Listener(
               behavior: HitTestBehavior.opaque,
-              onPointerDown: (e) => _handlePointerDownForDoubleTap(e, size),
+              onPointerDown: (e) => _handlePointerDown(e, size),
+              onPointerMove: _doubleTap.onPointerMove,
+              onPointerUp: _doubleTap.onPointerUp,
+              onPointerCancel: _doubleTap.onPointerCancel,
               child: RawGestureDetector(
                 behavior: HitTestBehavior.opaque,
                 gestures: <Type, GestureRecognizerFactory>{
