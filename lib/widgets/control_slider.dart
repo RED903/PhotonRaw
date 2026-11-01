@@ -45,6 +45,9 @@ class _ControlSliderState extends State<ControlSlider> {
   late TextEditingController _textController;
   final FocusNode _textFocusNode = FocusNode();
 
+  DateTime? _lastPointerDownTime;
+  Offset? _lastPointerDownPos;
+
   double get _uiValue => (widget.value / widget.scale).clamp(widget.min, widget.max);
 
   @override
@@ -84,6 +87,32 @@ class _ControlSliderState extends State<ControlSlider> {
     widget.onAutoTurnOn?.call();
     widget.onChanged(widget.defaultVal * widget.scale);
     widget.onChangeEnd?.call();
+  }
+
+  /// Slider 내부 제스처 인식기에 가로채이지 않도록 PointerDown 단계에서 직접 더블클릭 감지
+  void _handleSliderPointerDown(PointerDownEvent event) {
+    if (event.buttons != 0 && (event.buttons & 1) == 0) return;
+    final now = DateTime.now();
+    final pos = event.localPosition;
+    if (_lastPointerDownTime != null &&
+        _lastPointerDownPos != null &&
+        now.difference(_lastPointerDownTime!) <
+            const Duration(milliseconds: 350) &&
+        (pos - _lastPointerDownPos!).distance < 36.0) {
+      _lastPointerDownTime = null;
+      _lastPointerDownPos = null;
+      _resetToDefault();
+      // Slider의 첫 클릭 위치 이동을 덮어쓰기 위해 다음 마이크로태스크에서도 기본값 보장
+      Future.microtask(() {
+        if (mounted) {
+          widget.onChanged(widget.defaultVal * widget.scale);
+          widget.onChangeEnd?.call();
+        }
+      });
+      return;
+    }
+    _lastPointerDownTime = now;
+    _lastPointerDownPos = pos;
   }
 
   void _commitText(String raw) {
@@ -214,8 +243,9 @@ class _ControlSliderState extends State<ControlSlider> {
                     ),
             ],
           ),
-          GestureDetector(
-            onDoubleTap: _resetToDefault,
+          Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: _handleSliderPointerDown,
             child: SliderTheme(
               data: SliderTheme.of(context).copyWith(
                 trackHeight: 3.0,

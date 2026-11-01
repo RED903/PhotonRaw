@@ -1,12 +1,37 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
-/// SemiDarktable의 ColorEqualizerWidget (widgets.py 601~819행) 1:1 완벽 이식
+/// 8개 밴드 노드(32px) 또는 이퀄라이저 스플라인 곡선(26px) 근처를 터치했을 때만
+/// 즉시 GestureArena에서 승리하여 부모 ListView의 수직 스크롤을 차단하고,
+/// 곡선/노드에서 먼 빈 배경을 밀 때는 스크롤이 작동하도록 하는 인식기
+class _SelectiveEqPanGestureRecognizer extends PanGestureRecognizer {
+  bool Function(Offset localPosition)? shouldClaimImmediately;
+
+  _SelectiveEqPanGestureRecognizer({
+    this.shouldClaimImmediately,
+    super.debugOwner,
+  });
+
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    super.addAllowedPointer(event);
+    final claim = shouldClaimImmediately?.call(event.localPosition) ?? false;
+    if (claim) {
+      resolve(GestureDisposition.accepted);
+    } else {
+      resolve(GestureDisposition.rejected);
+    }
+  }
+}
+
+/// SemiDarktable의 ColorEqualizerWidget (widgets.py 601~819행) 1:1 완벽 이식 + 모바일 터치/스크롤 공존 최적화
 /// - 기본 시작 탭: 🎨 Hue (색조) — 스크롤 이동 시에도 선택된 모드 탭 유지
 /// - 모드별 고유 2D HSL 스펙트럼 배경 맵:
-///   1) Hue (색조): 상하 위치에 따라 Hue가 ±55° 회전하는 대각선 무지개 스펙트럼 (사진 2번)
-///   2) Saturation (채도): 상단 고채도(100%) 무지개에서 하단 무채색 회색(2%)으로 이어지는 스펙트럼 (사진 3번)
-///   3) Brightness (밝기): 상단 밝은 파스텔(L=94%)에서 하단 어두운 딥톤(L=9%)으로 이어지는 스펙트럼 (사진 4번)
+///   1) Hue (색조): 상하 위치에 따라 Hue가 ±55° 회전하는 대각선 무지개 스펙트럼
+///   2) Saturation (채도): 상단 고채도(100%) 무지개에서 하단 무채색 회색(2%)으로 이어지는 스펙트럼
+///   3) Brightness (밝기): 상단 밝은 파스텔(L=94%)에서 하단 어두운 딥톤(L=9%)으로 이어지는 스펙트럼
 /// - 8개 대역 수직 점선, 중앙 흰색 기준선, 양 끝이 원형 순환 연결되는 흰색 Smoothstep 스플라인 곡선(그림자 포함), 흰 테두리 원형 노드
+/// - 모바일에서 상하 드래그 시 ListView 스크롤에 뺏기지 않도록 노드(32px)·곡선(26px) 터치 시 제스처 즉시 선점
 class ColorEqualizerWidget extends StatefulWidget {
   final List<double> hue;
   final List<double> sat;
@@ -38,9 +63,14 @@ class ColorEqualizerWidget extends StatefulWidget {
 
 class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
     with AutomaticKeepAliveClientMixin {
+  static const double _nodeHitRadius = 32.0;
+  static const double _curveHitRadius = 26.0;
+
   // SemiDarktable 기본 시작 모드: 'hue' ('hue', 'sat', 'bri')
   late String _internalMode;
   int? _selectedBand;
+  DateTime? _lastTapTime;
+  Offset? _lastTapPos;
 
   @override
   bool get wantKeepAlive => true;
@@ -117,18 +147,69 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
     }
   }
 
-  int? _hitTestBand(double dx, double width) {
+  /// 주어진 x좌표에서의 스플라인 곡선 Y좌표 계산
+  double _evalSplineYAt(double dx, double width, double height, List<double> vals) {
+    final midY = height / 2.0;
+    final normX = (dx / width).clamp(0.0, 1.0);
+    double val = 0.0;
+    for (int i = 0; i < 8; i++) {
+      double dist = (normX - _centers[i]).abs();
+      if (dist > 0.5) {
+        dist = 1.0 - dist;
+      }
+      double weight = (1.0 - (dist / 0.16)).clamp(0.0, 1.0);
+      weight = weight * weight * (3.0 - 2.0 * weight);
+      final v = i < vals.length ? vals[i] : 0.0;
+      val += v * weight;
+    }
+    val = val.clamp(-1.0, 1.0);
+    return midY - (val * (midY - 14.0));
+  }
+
+  /// 터치 위치가 8개 밴드 노드(32px 반경) 또는 스플라인 곡선(26px 반경) 안쪽인지 판별
+  bool _isInteractiveTouch(Offset localPos, double width, double height) {
+    final vals = _currentValues;
+    final midY = height / 2.0;
+
     for (int i = 0; i < 8; i++) {
       final px = _centers[i] * width;
-      if ((dx - px).abs() < (width / 14.0)) {
-        return i;
+      final v = (i < vals.length ? vals[i] : 0.0).clamp(-1.0, 1.0);
+      final py = midY - (v * (midY - 14.0));
+      if ((Offset(px, py) - localPos).distance <= _nodeHitRadius) {
+        return true;
       }
     }
-    // 가장 가까운 밴드 반환
+
+    final curveY = _evalSplineYAt(localPos.dx, width, height, vals);
+    return (localPos.dy - curveY).abs() <= _curveHitRadius;
+  }
+
+  int _hitTestBand(Offset localPos, double width, double height) {
+    final vals = _currentValues;
+    final midY = height / 2.0;
+
+    // 1순위: 32px 반경 내에서 실제 노드(px, py)와의 2D 유클리드 거리가 가장 가까운 밴드
+    int? bestNodeIdx;
+    double bestNodeDist = _nodeHitRadius;
+    for (int i = 0; i < 8; i++) {
+      final px = _centers[i] * width;
+      final v = (i < vals.length ? vals[i] : 0.0).clamp(-1.0, 1.0);
+      final py = midY - (v * (midY - 14.0));
+      final d = (Offset(px, py) - localPos).distance;
+      if (d < bestNodeDist) {
+        bestNodeDist = d;
+        bestNodeIdx = i;
+      }
+    }
+    if (bestNodeIdx != null) {
+      return bestNodeIdx;
+    }
+
+    // 2순위: 수평 X좌표 기준 가장 가까운 밴드 반환
     int closest = 0;
     double minDist = double.infinity;
     for (int i = 0; i < 8; i++) {
-      final d = (dx - _centers[i] * width).abs();
+      final d = (localPos.dx - _centers[i] * width).abs();
       if (d < minDist) {
         minDist = d;
         closest = i;
@@ -139,8 +220,58 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
 
   double _valFromMouseY(double my, double height) {
     final midY = height / 2.0;
-    final denom = (midY - 12.0).clamp(1.0, 10000.0);
+    final denom = (midY - 14.0).clamp(1.0, 10000.0);
     return ((midY - my) / denom).clamp(-1.0, 1.0);
+  }
+
+  void _handlePointerDownForDoubleTap(
+    PointerDownEvent event,
+    double width,
+    double height,
+  ) {
+    final now = DateTime.now();
+    final pos = event.localPosition;
+    if (_lastTapTime != null &&
+        _lastTapPos != null &&
+        now.difference(_lastTapTime!) < const Duration(milliseconds: 320) &&
+        (pos - _lastTapPos!).distance < 32.0) {
+      _lastTapTime = null;
+      _lastTapPos = null;
+      _handleDoubleTapAt(pos, width, height);
+      return;
+    }
+    _lastTapTime = now;
+    _lastTapPos = pos;
+  }
+
+  void _handleDoubleTapAt(Offset localPos, double width, double height) {
+    widget.onChangeStart?.call();
+    widget.onAutoTurnOn?.call();
+    final vals = _currentValues;
+    final midY = height / 2.0;
+
+    int hitBand = -1;
+    double bestDist = _nodeHitRadius;
+    for (int i = 0; i < 8; i++) {
+      final px = _centers[i] * width;
+      final v = (i < vals.length ? vals[i] : 0.0).clamp(-1.0, 1.0);
+      final py = midY - (v * (midY - 14.0));
+      final d = (Offset(px, py) - localPos).distance;
+      if (d < bestDist) {
+        bestDist = d;
+        hitBand = i;
+      }
+    }
+
+    if (hitBand != -1) {
+      final updated = _currentValues;
+      updated[hitBand] = 0.0;
+      _emitUpdated(updated);
+    } else {
+      _emitUpdated(List<double>.filled(8, 0.0));
+    }
+    setState(() => _selectedBand = null);
+    widget.onChangeEnd?.call();
   }
 
   @override
@@ -198,77 +329,86 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
           ],
         ),
         const SizedBox(height: 6),
-        // SemiDarktable widgets.py ColorEqualizerWidget 캔버스 (135px 높이)
+        // SemiDarktable widgets.py ColorEqualizerWidget 캔버스 (148px 높이)
         LayoutBuilder(
           builder: (context, constraints) {
             final w = constraints.maxWidth.isFinite && constraints.maxWidth > 40
                 ? constraints.maxWidth
                 : 240.0;
-            const h = 136.0;
+            const h = 148.0;
             final size = Size(w, h);
 
-            return GestureDetector(
+            return Listener(
               behavior: HitTestBehavior.opaque,
-              onPanStart: (d) {
-                widget.onChangeStart?.call();
-                widget.onAutoTurnOn?.call();
-                final band = _hitTestBand(d.localPosition.dx, w);
-                setState(() => _selectedBand = band);
-                if (band != null) {
-                  final updated = _currentValues;
-                  updated[band] = _valFromMouseY(d.localPosition.dy, h);
-                  _emitUpdated(updated);
-                }
-              },
-              onPanUpdate: (d) {
-                final band = _selectedBand;
-                if (band != null) {
-                  final updated = _currentValues;
-                  updated[band] = _valFromMouseY(d.localPosition.dy, h);
-                  _emitUpdated(updated);
-                }
-              },
-              onPanEnd: (_) {
-                setState(() => _selectedBand = null);
-                widget.onChangeEnd?.call();
-              },
-              onDoubleTapDown: (d) {
-                widget.onChangeStart?.call();
-                widget.onAutoTurnOn?.call();
-                int hitBand = -1;
-                for (int i = 0; i < 8; i++) {
-                  final px = _centers[i] * w;
-                  if ((d.localPosition.dx - px).abs() < (w / 14.0)) {
-                    hitBand = i;
-                    break;
-                  }
-                }
-                if (hitBand != -1) {
-                  final updated = _currentValues;
-                  updated[hitBand] = 0.0;
-                  _emitUpdated(updated);
-                } else {
-                  _emitUpdated(List<double>.filled(8, 0.0));
-                }
-                setState(() => _selectedBand = null);
-                widget.onChangeEnd?.call();
-              },
-              child: Container(
-                width: w,
-                height: h,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: const Color(0xFF2D2D2D)),
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(3),
-                  child: CustomPaint(
-                    size: size,
-                    painter: _ColorEqPainter(
-                      mode: mode,
-                      values: vals,
-                      centers: _centers,
-                      bandColors: _bandColors,
+              onPointerDown: (e) => _handlePointerDownForDoubleTap(e, w, h),
+              child: RawGestureDetector(
+                behavior: HitTestBehavior.opaque,
+                gestures: <Type, GestureRecognizerFactory>{
+                  _SelectiveEqPanGestureRecognizer:
+                      GestureRecognizerFactoryWithHandlers<
+                          _SelectiveEqPanGestureRecognizer>(
+                    () => _SelectiveEqPanGestureRecognizer(debugOwner: this),
+                    (_SelectiveEqPanGestureRecognizer instance) {
+                      instance.shouldClaimImmediately =
+                          (pos) => _isInteractiveTouch(pos, w, h);
+                      instance.onStart = (d) {
+                        widget.onChangeStart?.call();
+                        widget.onAutoTurnOn?.call();
+                        final band = _hitTestBand(d.localPosition, w, h);
+                        setState(() => _selectedBand = band);
+                        final updated = _currentValues;
+                        updated[band] = _valFromMouseY(d.localPosition.dy, h);
+                        _emitUpdated(updated);
+                      };
+                      instance.onUpdate = (d) {
+                        final band = _selectedBand;
+                        if (band != null) {
+                          final updated = _currentValues;
+                          updated[band] =
+                              _valFromMouseY(d.localPosition.dy, h);
+                          _emitUpdated(updated);
+                        }
+                      };
+                      instance.onEnd = (_) {
+                        setState(() => _selectedBand = null);
+                        widget.onChangeEnd?.call();
+                      };
+                    },
+                  ),
+                },
+                child: Container(
+                  width: w,
+                  height: h,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFF2D2D2D)),
+                  ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(3),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        // 2D HSL 스펙트럼 배경은 모드('hue', 'sat', 'bri')가 바뀔 때만 그리도록 RepaintBoundary로 완전 캐싱
+                        RepaintBoundary(
+                          child: CustomPaint(
+                            size: size,
+                            painter: _ColorEqBgPainter(
+                              mode: mode,
+                              centers: _centers,
+                            ),
+                          ),
+                        ),
+                        // 드래그 중에는 가벼운 스플라인 곡선과 8개 노드만 즉시 리페인트 (120fps)
+                        CustomPaint(
+                          size: size,
+                          painter: _ColorEqOverlayPainter(
+                            values: vals,
+                            centers: _centers,
+                            bandColors: _bandColors,
+                            selectedBand: _selectedBand,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -276,28 +416,31 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
             );
           },
         ),
+        const SizedBox(height: 4),
+        const Text(
+          '노드/곡선 드래그: 대역 조절 (빈 영역 스와이프: 스크롤) | 노드 더블탭: 초기화',
+          style: TextStyle(fontSize: 9.5, color: Color(0xFF777777)),
+          textAlign: TextAlign.center,
+        ),
       ],
     );
   }
 }
 
-class _ColorEqPainter extends CustomPainter {
+class _ColorEqBgPainter extends CustomPainter {
   final String mode;
-  final List<double> values;
   final List<double> centers;
-  final List<Color> bandColors;
 
-  _ColorEqPainter({
+  _ColorEqBgPainter({
     required this.mode,
-    required this.values,
     required this.centers,
-    required this.bandColors,
   });
 
   /// SemiDarktable widgets.py 679~692행 get_base_hue 1:1 이식
   static double _getBaseHue(double normX) {
     const c = [0.0625, 0.1875, 0.3125, 0.4375, 0.5625, 0.6875, 0.8125, 0.9375];
     const h = [0.0, 35.0, 60.0, 120.0, 180.0, 240.0, 280.0, 325.0];
+
     if (normX <= c[0]) {
       final t = normX / c[0];
       return (340.0 + t * 20.0) % 360.0;
@@ -338,9 +481,9 @@ class _ColorEqPainter extends CustomPainter {
     final h = size.height;
     if (w <= 0 || h <= 0) return;
 
-    // 1. SemiDarktable widgets.py _get_bg_image(bw=120, bh=60)와 100% 동일한 2D HSL 스펙트럼 배경 렌더링
-    const int rows = 56;
-    const int cols = 40;
+    // 1. 2D HSL 스펙트럼 배경 렌더링 (모드 변경 시에만 1회 실행 후 GPU 텍스처로 캐싱됨)
+    const int rows = 40;
+    const int cols = 32;
     final stopPositions = List<double>.generate(
       cols + 1,
       (i) => i / cols.toDouble(),
@@ -362,7 +505,7 @@ class _ColorEqPainter extends CustomPainter {
       canvas.drawRect(stripRect, paint);
     }
 
-    // 2. 8개 대역 구분 수직 점선 격자 (widgets.py 734~738행: QColor(0, 0, 0, 90), DashLine)
+    // 2. 8개 대역 구분 수직 점선 격자
     final gridPaint = Paint()
       ..color = const Color.fromARGB(90, 0, 0, 0)
       ..strokeWidth = 1.0;
@@ -376,7 +519,7 @@ class _ColorEqPainter extends CustomPainter {
       }
     }
 
-    // 3. 중심 기준선 0.0 Neutral (widgets.py 741~743행: QColor(255, 255, 255, 160), 두께 1.5)
+    // 3. 중심 기준선 0.0 Neutral
     final midY = h / 2.0;
     canvas.drawLine(
       Offset(0, midY),
@@ -385,25 +528,52 @@ class _ColorEqPainter extends CustomPainter {
         ..color = const Color.fromARGB(160, 255, 255, 255)
         ..strokeWidth = 1.5,
     );
+  }
 
-    // 4. 양 끝이 자연스럽게 이어지는 원형 순환 Smoothstep 스플라인 곡선 (widgets.py 746~772행)
+  @override
+  bool shouldRepaint(covariant _ColorEqBgPainter oldDelegate) {
+    return oldDelegate.mode != mode;
+  }
+}
+
+class _ColorEqOverlayPainter extends CustomPainter {
+  final List<double> values;
+  final List<double> centers;
+  final List<Color> bandColors;
+  final int? selectedBand;
+
+  _ColorEqOverlayPainter({
+    required this.values,
+    required this.centers,
+    required this.bandColors,
+    this.selectedBand,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width;
+    final h = size.height;
+    if (w <= 0 || h <= 0) return;
+    final midY = h / 2.0;
+
+    // 4. 양 끝이 자연스럽게 이어지는 원형 순환 Smoothstep 스플라인 곡선
     final path = Path();
-    const double step = 2.0;
+    const double step = 2.5;
     for (double x = 0; x <= w; x += step) {
       final normX = (x / w).clamp(0.0, 1.0);
       double val = 0.0;
       for (int i = 0; i < 8; i++) {
         double dist = (normX - centers[i]).abs();
         if (dist > 0.5) {
-          dist = 1.0 - dist; // 원형 순환 거리
+          dist = 1.0 - dist;
         }
         double weight = (1.0 - (dist / 0.16)).clamp(0.0, 1.0);
-        weight = weight * weight * (3.0 - 2.0 * weight); // Smoothstep
+        weight = weight * weight * (3.0 - 2.0 * weight);
         final v = i < values.length ? values[i] : 0.0;
         val += v * weight;
       }
       val = val.clamp(-1.0, 1.0);
-      final py = midY - (val * (midY - 12.0));
+      final py = midY - (val * (midY - 14.0));
       if (x == 0) {
         path.moveTo(x, py);
       } else {
@@ -411,7 +581,6 @@ class _ColorEqPainter extends CustomPainter {
       }
     }
 
-    // 곡선 그림자 (QColor(0, 0, 0, 120), 4.0) 및 순백색 메인 곡선 (#ffffff, 2.2)
     canvas.drawPath(
       path,
       Paint()
@@ -429,34 +598,39 @@ class _ColorEqPainter extends CustomPainter {
         ..strokeCap = StrokeCap.round,
     );
 
-    // 5. 8개 색상 포인트 노드 (widgets.py 775~788행: 반경 6.0, 밴드 컬러 채움 + 외곽 검정 림 + 흰색 테두리)
+    // 5. 8개 색상 포인트 노드
     for (int i = 0; i < 8; i++) {
       final px = centers[i] * w;
       final v = (i < values.length ? values[i] : 0.0).clamp(-1.0, 1.0);
-      final py = midY - (v * (midY - 12.0));
+      final py = midY - (v * (midY - 14.0));
       final pt = Offset(px, py);
+      final isSelected = selectedBand == i;
 
-      // 외곽 검정 림
       canvas.drawCircle(
         pt,
-        6.5,
+        isSelected ? 14.5 : 10.5,
         Paint()
-          ..color = const Color.fromARGB(150, 0, 0, 0)
+          ..color = Colors.white.withValues(alpha: isSelected ? 0.36 : 0.16)
+          ..style = PaintingStyle.fill,
+      );
+      canvas.drawCircle(
+        pt,
+        isSelected ? 8.0 : 7.0,
+        Paint()
+          ..color = const Color.fromARGB(160, 0, 0, 0)
           ..strokeWidth = 2.0
           ..style = PaintingStyle.stroke,
       );
-      // 밴드 색상 채움
       canvas.drawCircle(
         pt,
-        6.0,
+        isSelected ? 7.5 : 6.5,
         Paint()
           ..color = bandColors[i]
           ..style = PaintingStyle.fill,
       );
-      // 흰색 테두리
       canvas.drawCircle(
         pt,
-        6.0,
+        isSelected ? 7.5 : 6.5,
         Paint()
           ..color = Colors.white
           ..strokeWidth = 2.0
@@ -466,7 +640,8 @@ class _ColorEqPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _ColorEqPainter oldDelegate) {
-    return oldDelegate.mode != mode || oldDelegate.values != values;
+  bool shouldRepaint(covariant _ColorEqOverlayPainter oldDelegate) {
+    return oldDelegate.values != values ||
+        oldDelegate.selectedBand != selectedBand;
   }
 }

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'package:flutter/gestures.dart';
@@ -12,7 +13,8 @@ import '../models/pipeline_params.dart';
 /// - 인터랙티브 크롭 박스 편집 모드 (모서리/변/내부 드래그 및 화면비 고정 지원)
 /// - 2점 수평선 그리기 모드 (두 점 드래그로 기울기 각도 자동 계산)
 /// - 화이트밸런스 스포이드 모드 (클릭 지점 뉴트럴 픽셀 샘플링)
-/// - 잡티 제거(Spot Removal) 인터랙티브 추가/드래그/우클릭 삭제 모드
+/// - 스팟 리무버(Spot Remover) 브러시 미리보기, 칠하기(브러시 스트로크), 타겟/소스 개별 이동 및 우클릭 삭제
+/// - 적목 제거(Red-Eye) 브러시 미리보기 및 클릭/드래그 보정 모드
 class ViewportCanvas extends StatefulWidget {
   final ui.Image? processedImage;
   final ui.Image? beforeImage;
@@ -24,6 +26,14 @@ class ViewportCanvas extends StatefulWidget {
   final bool wbPickerMode;
   final bool spotEditMode;
   final double newSpotRadius;
+  final int? selectedSpotIndex;
+  final ValueChanged<int?>? onSelectedSpotChanged;
+  final (double, double) Function(double tx, double ty, double r)?
+      onResolveSmartSpotSource;
+  final bool redEyeEditMode;
+  final double newRedEyeRadius;
+  final double newRedEyeStrength;
+  final ValueChanged<List<RedEyeSpot>>? onRedEyesChanged;
   final VoidCallback onOpenFileRequested;
   final ValueChanged<double> onSplitPositionChanged;
   final ValueChanged<List<double>> onCropRectChanged;
@@ -43,6 +53,13 @@ class ViewportCanvas extends StatefulWidget {
     required this.wbPickerMode,
     required this.spotEditMode,
     required this.newSpotRadius,
+    this.selectedSpotIndex,
+    this.onSelectedSpotChanged,
+    this.onResolveSmartSpotSource,
+    this.redEyeEditMode = false,
+    this.newRedEyeRadius = 0.025,
+    this.newRedEyeStrength = 0.85,
+    this.onRedEyesChanged,
     required this.onOpenFileRequested,
     required this.onSplitPositionChanged,
     required this.onCropRectChanged,
@@ -70,6 +87,41 @@ class ViewportCanvasState extends State<ViewportCanvas> {
   Offset? _horizonEnd;
 
   int? _draggingSpotIndex;
+  String? _spotDragPart; // 'target', 'source', 'stroke'
+  Offset? _spotDragLastNorm;
+  final List<Offset> _activeStrokeNorm = [];
+
+  int? _draggingRedEyeIndex;
+
+  bool _isMiddleMousePanning = false;
+  Offset? _hoverLocalPos;
+  bool _showRadiusGuide = false;
+  Timer? _radiusGuideTimer;
+
+  @override
+  void didUpdateWidget(covariant ViewportCanvas oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 브러시 크기 슬라이더를 조절할 때 화면 중앙(또는 선택된 스팟)에 브러시 크기를 즉시 가늠할 수 있도록 가이드 원 표시
+    if ((widget.spotEditMode &&
+            (widget.newSpotRadius - oldWidget.newSpotRadius).abs() > 1e-5) ||
+        (widget.redEyeEditMode &&
+            (widget.newRedEyeRadius - oldWidget.newRedEyeRadius).abs() >
+                1e-5)) {
+      _showRadiusGuide = true;
+      _radiusGuideTimer?.cancel();
+      _radiusGuideTimer = Timer(const Duration(milliseconds: 1200), () {
+        if (mounted) {
+          setState(() => _showRadiusGuide = false);
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _radiusGuideTimer?.cancel();
+    super.dispose();
+  }
 
   /// 외부에서 줌/팬 초기화 호출용
   void resetZoom() {
@@ -144,7 +196,67 @@ class ViewportCanvasState extends State<ViewportCanvas> {
     }
   }
 
+  (double, double) _resolveSmartSource(double tx, double ty, double r) {
+    if (widget.onResolveSmartSpotSource != null) {
+      return widget.onResolveSmartSpotSource!(tx, ty, r);
+    }
+    final offsetNorm = (r * 2.4).clamp(0.025, 0.16);
+    final srcX = (tx + offsetNorm <= 0.96)
+        ? tx + offsetNorm
+        : tx - offsetNorm;
+    return (srcX.clamp(0.02, 0.98), ty.clamp(0.02, 0.98));
+  }
+
+  /// 화면 좌표 pos가 특정 스팟(단일 원 또는 브러시 스트로크 경로)의 타겟 또는 소스 영역 안에 있는지 판정
+  bool _hitTestSpotShape(
+    Offset pos,
+    Rect imgRect,
+    Spot s, {
+    required bool isSource,
+  }) {
+    final maxDim = math.max(imgRect.width, imgRect.height);
+    final hitR = math.max(16.0, s.r * maxDim + 5.0);
+    final offX = isSource ? (s.srcX - s.x) : 0.0;
+    final offY = isSource ? (s.srcY - s.y) : 0.0;
+
+    final anchor = Offset(
+      imgRect.left + (s.x + offX) * imgRect.width,
+      imgRect.top + (s.y + offY) * imgRect.height,
+    );
+    if ((anchor - pos).distance <= hitR) return true;
+
+    if (s.path.length >= 2) {
+      for (int k = 0; k < s.path.length - 1; k++) {
+        final a = Offset(
+          imgRect.left + (s.path[k][0] + offX) * imgRect.width,
+          imgRect.top + (s.path[k][1] + offY) * imgRect.height,
+        );
+        final b = Offset(
+          imgRect.left + (s.path[k + 1][0] + offX) * imgRect.width,
+          imgRect.top + (s.path[k + 1][1] + offY) * imgRect.height,
+        );
+        if (_distToSeg(pos, a, b) <= hitR) return true;
+      }
+    }
+    return false;
+  }
+
+  double _distToSeg(Offset p, Offset a, Offset b) {
+    final vx = b.dx - a.dx;
+    final vy = b.dy - a.dy;
+    final wx = p.dx - a.dx;
+    final wy = p.dy - a.dy;
+    final c1 = wx * vx + wy * vy;
+    if (c1 <= 0.0) return (p - a).distance;
+    final c2 = vx * vx + vy * vy;
+    if (c2 <= c1) return (p - b).distance;
+    final t = c1 / c2;
+    final proj = Offset(a.dx + t * vx, a.dy + t * vy);
+    return (p - proj).distance;
+  }
+
   void _onTapUp(TapUpDetails details, Size size) {
+    if (_isMiddleMousePanning) return;
     final img = widget.processedImage;
     if (img == null) return;
     final imgRect = _computeImageRect(size);
@@ -157,51 +269,99 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       return;
     }
 
-    // 2. 잡티 제거(Spot Removal) 클릭 추가
+    final maxDim = math.max(imgRect.width, imgRect.height);
+
+    // 2. 스팟 리무버(Spot Remover) 클릭 선택 또는 새 단일 스팟 추가
     if (widget.spotEditMode) {
       final spots = widget.params.spots.map((s) => s.clone()).toList();
-      // 기존 스팟 위를 클릭했는지 확인
-      for (int i = 0; i < spots.length; i++) {
-        final sx = imgRect.left + spots[i].x * imgRect.width;
-        final sy = imgRect.top + spots[i].y * imgRect.height;
-        if ((Offset(sx, sy) - details.localPosition).distance <= 14.0) {
+      for (int i = spots.length - 1; i >= 0; i--) {
+        final s = spots[i];
+        if (_hitTestSpotShape(details.localPosition, imgRect, s, isSource: true) ||
+            _hitTestSpotShape(details.localPosition, imgRect, s, isSource: false)) {
+          widget.onSelectedSpotChanged?.call(i);
           return;
         }
       }
-      final offsetNorm = (widget.newSpotRadius * 2.2).clamp(0.02, 0.15);
-      final srcX = (norm.dx + offsetNorm <= 0.96)
-          ? norm.dx + offsetNorm
-          : norm.dx - offsetNorm;
+      final r = widget.newSpotRadius;
+      final src = _resolveSmartSource(norm.dx, norm.dy, r);
       spots.add(
         Spot(
           x: norm.dx,
           y: norm.dy,
-          srcX: srcX.clamp(0.02, 0.98),
-          srcY: norm.dy,
-          r: widget.newSpotRadius,
+          srcX: src.$1,
+          srcY: src.$2,
+          r: r,
         ),
       );
+      widget.onSelectedSpotChanged?.call(spots.length - 1);
       widget.onSpotsChanged(spots);
+      return;
+    }
+
+    // 3. 적목 제거(Red-Eye) 클릭 추가
+    if (widget.redEyeEditMode && widget.onRedEyesChanged != null) {
+      final redEyes = widget.params.redEyes.map((e) => e.clone()).toList();
+      for (int i = redEyes.length - 1; i >= 0; i--) {
+        final re = redEyes[i];
+        final hitR = math.max(16.0, re.r * maxDim + 4.0);
+        final cx = imgRect.left + re.x * imgRect.width;
+        final cy = imgRect.top + re.y * imgRect.height;
+        if ((Offset(cx, cy) - details.localPosition).distance <= hitR) {
+          return;
+        }
+      }
+      redEyes.add(
+        RedEyeSpot(
+          x: norm.dx,
+          y: norm.dy,
+          r: widget.newRedEyeRadius,
+          strength: widget.newRedEyeStrength,
+        ),
+      );
+      widget.onRedEyesChanged!(redEyes);
     }
   }
 
   void _onSecondaryTapUp(TapUpDetails details, Size size) {
-    // 우클릭 시 해당 위치의 잡티 제거 포인트 삭제
-    if (!widget.spotEditMode || widget.processedImage == null) return;
+    if (widget.processedImage == null) return;
     final imgRect = _computeImageRect(size);
-    final spots = widget.params.spots.map((s) => s.clone()).toList();
-    for (int i = spots.length - 1; i >= 0; i--) {
-      final sx = imgRect.left + spots[i].x * imgRect.width;
-      final sy = imgRect.top + spots[i].y * imgRect.height;
-      if ((Offset(sx, sy) - details.localPosition).distance <= 18.0) {
-        spots.removeAt(i);
-        widget.onSpotsChanged(spots);
-        return;
+    final maxDim = math.max(imgRect.width, imgRect.height);
+
+    // 우클릭 시 해당 위치의 스팟 리무버 포인트/스트로크 삭제
+    if (widget.spotEditMode) {
+      final spots = widget.params.spots.map((s) => s.clone()).toList();
+      for (int i = spots.length - 1; i >= 0; i--) {
+        if (_hitTestSpotShape(details.localPosition, imgRect, spots[i], isSource: true) ||
+            _hitTestSpotShape(details.localPosition, imgRect, spots[i], isSource: false)) {
+          spots.removeAt(i);
+          widget.onSelectedSpotChanged?.call(
+            spots.isEmpty ? null : spots.length - 1,
+          );
+          widget.onSpotsChanged(spots);
+          return;
+        }
+      }
+    }
+
+    // 우클릭 시 해당 위치의 적목 제거 포인트 삭제
+    if (widget.redEyeEditMode && widget.onRedEyesChanged != null) {
+      final redEyes = widget.params.redEyes.map((e) => e.clone()).toList();
+      for (int i = redEyes.length - 1; i >= 0; i--) {
+        final hitR = math.max(18.0, redEyes[i].r * maxDim + 6.0);
+        final cx = imgRect.left + redEyes[i].x * imgRect.width;
+        final cy = imgRect.top + redEyes[i].y * imgRect.height;
+        if ((Offset(cx, cy) - details.localPosition).distance <= hitR) {
+          redEyes.removeAt(i);
+          widget.onRedEyesChanged!(redEyes);
+          return;
+        }
       }
     }
   }
 
   void _onScaleStart(ScaleStartDetails details, Size size) {
+    // 마우스 휠 클릭(중간 버튼) 드래그 중에는 스팟 선택/생성을 하지 않고 화면 팬(Pan)만 수행
+    if (_isMiddleMousePanning) return;
     final img = widget.processedImage;
     if (img == null) return;
     _scaleStartZoom = _zoom;
@@ -212,6 +372,9 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       _draggingSplit = false;
       _cropDragHandle = null;
       _draggingSpotIndex = null;
+      _spotDragPart = null;
+      _activeStrokeNorm.clear();
+      _draggingRedEyeIndex = null;
       _horizonStart = null;
       _horizonEnd = null;
       return;
@@ -220,6 +383,7 @@ class ViewportCanvasState extends State<ViewportCanvas> {
 
     final imgRect = _computeImageRect(size);
     final pos = details.localFocalPoint;
+    setState(() => _hoverLocalPos = pos);
 
     // 1. 수평선 2점 그리기 모드
     if (widget.horizonMode) {
@@ -241,20 +405,84 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       }
     }
 
-    // 3. 잡티 제거 포인트 드래그 이동
+    final maxDim = math.max(imgRect.width, imgRect.height);
+
+    // 3. 스팟 리무버: 기존 타겟/소스 모양 개별 드래그 또는 빈 곳 브러시 스트로크 그리기 시작
     if (widget.spotEditMode) {
+      final norm = _localToImageNorm(pos, imgRect);
+      if (norm == null) return;
       final spots = widget.params.spots;
-      for (int i = 0; i < spots.length; i++) {
-        final sx = imgRect.left + spots[i].x * imgRect.width;
-        final sy = imgRect.top + spots[i].y * imgRect.height;
-        if ((Offset(sx, sy) - pos).distance <= 16.0) {
+      final order = <int>[
+        if (widget.selectedSpotIndex != null &&
+            widget.selectedSpotIndex! >= 0 &&
+            widget.selectedSpotIndex! < spots.length)
+          widget.selectedSpotIndex!,
+        for (int i = spots.length - 1; i >= 0; i--)
+          if (i != widget.selectedSpotIndex) i,
+      ];
+
+      for (final i in order) {
+        final s = spots[i];
+        // 소스(덮을 위치, 파란 모양) 먼저 히트 테스트
+        if (_hitTestSpotShape(pos, imgRect, s, isSource: true)) {
           _draggingSpotIndex = i;
+          _spotDragPart = 'source';
+          _spotDragLastNorm = norm;
+          widget.onSelectedSpotChanged?.call(i);
+          return;
+        }
+        // 타겟(내가 찍은 스팟 위치, 주황 모양) 히트 테스트
+        if (_hitTestSpotShape(pos, imgRect, s, isSource: false)) {
+          _draggingSpotIndex = i;
+          _spotDragPart = 'target';
+          _spotDragLastNorm = norm;
+          widget.onSelectedSpotChanged?.call(i);
           return;
         }
       }
+
+      // 빈 영역에서 드래그 시작 시: 드래그하는 동안 브러시 모양 궤적을 그리고, 드래그가 끝날 때 하나의 툴로 생성
+      setState(() {
+        _spotDragPart = 'stroke';
+        _draggingSpotIndex = null;
+        _activeStrokeNorm
+          ..clear()
+          ..add(norm);
+      });
+      return;
     }
 
-    // 4. Before/After 분할선 드래그
+    // 4. 적목 제거(Red-Eye) 드래그 이동 또는 새 적목 스팟 브러시 추가
+    if (widget.redEyeEditMode && widget.onRedEyesChanged != null) {
+      final redEyes = widget.params.redEyes;
+      for (int i = redEyes.length - 1; i >= 0; i--) {
+        final re = redEyes[i];
+        final hitR = math.max(18.0, re.r * maxDim + 6.0);
+        final cx = imgRect.left + re.x * imgRect.width;
+        final cy = imgRect.top + re.y * imgRect.height;
+        if ((Offset(cx, cy) - pos).distance <= hitR) {
+          _draggingRedEyeIndex = i;
+          return;
+        }
+      }
+      final norm = _localToImageNorm(pos, imgRect);
+      if (norm != null) {
+        final next = redEyes.map((e) => e.clone()).toList()
+          ..add(
+            RedEyeSpot(
+              x: norm.dx,
+              y: norm.dy,
+              r: widget.newRedEyeRadius,
+              strength: widget.newRedEyeStrength,
+            ),
+          );
+        _draggingRedEyeIndex = next.length - 1;
+        widget.onRedEyesChanged!(next);
+      }
+      return;
+    }
+
+    // 5. Before/After 분할선 드래그
     if (widget.params.splitViewEnabled) {
       final splitX =
           imgRect.left + widget.params.splitPosition * imgRect.width;
@@ -266,13 +494,17 @@ class ViewportCanvasState extends State<ViewportCanvas> {
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details, Size size) {
+    if (_isMiddleMousePanning) return;
     final img = widget.processedImage;
     if (img == null) return;
 
     // 두 손가락 핀치 확대/축소 및 팬 이동 처리 (모바일 멀티터치 완벽 지원)
-    if (details.pointerCount >= 2 || _isPinching || (details.scale - 1.0).abs() > 1e-3) {
+    if (details.pointerCount >= 2 ||
+        _isPinching ||
+        (details.scale - 1.0).abs() > 1e-3) {
       _isPinching = true;
       setState(() {
+        _activeStrokeNorm.clear();
         _zoom = (_scaleStartZoom * details.scale).clamp(0.25, 16.0);
         _pan += details.focalPointDelta;
         if ((_zoom - 1.0).abs() < 0.03) {
@@ -284,6 +516,7 @@ class ViewportCanvasState extends State<ViewportCanvas> {
 
     final imgRect = _computeImageRect(size);
     final pos = details.localFocalPoint;
+    setState(() => _hoverLocalPos = pos);
 
     // 1. 수평선 그리기 업데이트
     if (widget.horizonMode && _horizonStart != null) {
@@ -348,25 +581,67 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       return;
     }
 
-    // 3. 잡티 제거 포인트 이동
-    if (widget.spotEditMode && _draggingSpotIndex != null) {
+    // 3. 스팟 리무버(Spot Remover): 타겟 이동 / 소스 이동 / 브러시 스트로크 드로잉
+    if (widget.spotEditMode) {
       final norm = _localToImageNorm(pos, imgRect);
       if (norm == null) return;
+
+      if (_spotDragPart == 'stroke') {
+        if (_activeStrokeNorm.isEmpty ||
+            (norm - _activeStrokeNorm.last).distance >= 0.003) {
+          setState(() {
+            _activeStrokeNorm.add(norm);
+          });
+        }
+        return;
+      }
+
       final spots = widget.params.spots.map((s) => s.clone()).toList();
-      if (_draggingSpotIndex! < spots.length) {
-        final old = spots[_draggingSpotIndex!];
-        final dx = norm.dx - old.x;
-        final dy = norm.dy - old.y;
-        old.x = norm.dx;
-        old.y = norm.dy;
-        old.srcX = (old.srcX + dx).clamp(0.01, 0.99);
-        old.srcY = (old.srcY + dy).clamp(0.01, 0.99);
-        widget.onSpotsChanged(spots);
+      if (_draggingSpotIndex != null &&
+          _draggingSpotIndex! < spots.length &&
+          _spotDragLastNorm != null) {
+        final s = spots[_draggingSpotIndex!];
+        final dx = norm.dx - _spotDragLastNorm!.dx;
+        final dy = norm.dy - _spotDragLastNorm!.dy;
+        _spotDragLastNorm = norm;
+
+        if (_spotDragPart == 'target') {
+          // 내가 찍은 스팟/스트로크(타겟) 위치만 독립적으로 이동
+          s.x = (s.x + dx).clamp(0.01, 0.99);
+          s.y = (s.y + dy).clamp(0.01, 0.99);
+          for (final pt in s.path) {
+            pt[0] = (pt[0] + dx).clamp(0.0, 1.0);
+            pt[1] = (pt[1] + dy).clamp(0.0, 1.0);
+          }
+          widget.onSpotsChanged(spots);
+        } else if (_spotDragPart == 'source') {
+          // 덮을 위치(소스)만 독립적으로 이동
+          s.srcX = (s.srcX + dx).clamp(0.01, 0.99);
+          s.srcY = (s.srcY + dy).clamp(0.01, 0.99);
+          widget.onSpotsChanged(spots);
+        }
       }
       return;
     }
 
-    // 4. Before/After 분할선 이동
+    // 4. 적목 제거(Red-Eye) 이동 (한손가락/좌클릭 드래그 시 화면 이동 차단)
+    if (widget.redEyeEditMode) {
+      if (_draggingRedEyeIndex != null && widget.onRedEyesChanged != null) {
+        final norm = _localToImageNorm(pos, imgRect);
+        if (norm != null) {
+          final redEyes =
+              widget.params.redEyes.map((e) => e.clone()).toList();
+          if (_draggingRedEyeIndex! < redEyes.length) {
+            redEyes[_draggingRedEyeIndex!].x = norm.dx.clamp(0.01, 0.99);
+            redEyes[_draggingRedEyeIndex!].y = norm.dy.clamp(0.01, 0.99);
+            widget.onRedEyesChanged!(redEyes);
+          }
+        }
+      }
+      return;
+    }
+
+    // 5. Before/After 분할선 이동
     if (_draggingSplit) {
       final norm = _localToImageNorm(pos, imgRect);
       if (norm != null) {
@@ -375,13 +650,14 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       return;
     }
 
-    // 5. 기본 팬(Pan) 이동
+    // 6. 기본 팬(Pan) 이동
     setState(() {
       _pan += details.focalPointDelta;
     });
   }
 
   void _onScaleEnd(ScaleEndDetails details) {
+    if (_isMiddleMousePanning) return;
     if (!_isPinching &&
         widget.horizonMode &&
         _horizonStart != null &&
@@ -399,16 +675,66 @@ class ViewportCanvasState extends State<ViewportCanvas> {
         _horizonEnd = null;
       });
     }
+
+    // 스팟 리무버 브러시 드래그 종료 시: 그려진 모양 그대로 하나의 스팟 툴로 생성하여 대체!
+    if (!_isPinching &&
+        widget.spotEditMode &&
+        _spotDragPart == 'stroke' &&
+        _activeStrokeNorm.isNotEmpty) {
+      final strokePts = List<Offset>.from(_activeStrokeNorm);
+      setState(() {
+        _activeStrokeNorm.clear();
+        _spotDragPart = null;
+      });
+
+      var sumX = 0.0, sumY = 0.0;
+      for (final pt in strokePts) {
+        sumX += pt.dx;
+        sumY += pt.dy;
+      }
+      final cx = (sumX / strokePts.length).clamp(0.01, 0.99);
+      final cy = (sumY / strokePts.length).clamp(0.01, 0.99);
+      final r = widget.newSpotRadius;
+      final src = _resolveSmartSource(cx, cy, r);
+      final isMultiPoint = strokePts.length >= 2 &&
+          (strokePts.last - strokePts.first).distance > 0.004;
+
+      final spots = widget.params.spots.map((s) => s.clone()).toList()
+        ..add(
+          Spot(
+            x: cx,
+            y: cy,
+            r: r,
+            srcX: src.$1,
+            srcY: src.$2,
+            path: isMultiPoint
+                ? [
+                    for (final pt in strokePts) [pt.dx, pt.dy],
+                  ]
+                : [],
+          ),
+        );
+      widget.onSelectedSpotChanged?.call(spots.length - 1);
+      widget.onSpotsChanged(spots);
+    }
+
     _isPinching = false;
     _draggingSplit = false;
     _cropDragHandle = null;
     _cropDragStartNorm = null;
     _cropRectAtStart = null;
     _draggingSpotIndex = null;
+    _spotDragPart = null;
+    _spotDragLastNorm = null;
+    _activeStrokeNorm.clear();
+    _draggingRedEyeIndex = null;
   }
 
   MouseCursor _resolveCursor() {
-    if (widget.wbPickerMode || widget.horizonMode || widget.spotEditMode) {
+    if (widget.wbPickerMode ||
+        widget.horizonMode ||
+        widget.spotEditMode ||
+        widget.redEyeEditMode) {
       return SystemMouseCursors.precise;
     }
     if (widget.cropEditMode) {
@@ -493,8 +819,47 @@ class ViewportCanvasState extends State<ViewportCanvas> {
 
         return MouseRegion(
           cursor: _resolveCursor(),
+          onHover: (e) {
+            if (widget.spotEditMode || widget.redEyeEditMode) {
+              setState(() => _hoverLocalPos = e.localPosition);
+            }
+          },
+          onExit: (_) {
+            if (_hoverLocalPos != null) {
+              setState(() => _hoverLocalPos = null);
+            }
+          },
           child: Listener(
             onPointerSignal: (e) => _onPointerSignal(e, size),
+            onPointerDown: (e) {
+              // 마우스 휠 클릭(중간 버튼)으로 언제나 자유롭게 화면 드래그(Pan) 가능
+              if ((e.buttons & kMiddleMouseButton) != 0) {
+                setState(() {
+                  _isMiddleMousePanning = true;
+                  _activeStrokeNorm.clear();
+                });
+              }
+            },
+            onPointerMove: (e) {
+              if (_isMiddleMousePanning ||
+                  (e.buttons & kMiddleMouseButton) != 0) {
+                setState(() {
+                  _isMiddleMousePanning = true;
+                  _pan += e.delta;
+                });
+              }
+            },
+            onPointerUp: (e) {
+              if (_isMiddleMousePanning &&
+                  (e.buttons & kMiddleMouseButton) == 0) {
+                setState(() => _isMiddleMousePanning = false);
+              }
+            },
+            onPointerCancel: (_) {
+              if (_isMiddleMousePanning) {
+                setState(() => _isMiddleMousePanning = false);
+              }
+            },
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onDoubleTap: resetZoom,
@@ -518,6 +883,13 @@ class ViewportCanvasState extends State<ViewportCanvas> {
                       horizonStart: _horizonStart,
                       horizonEnd: _horizonEnd,
                       spotEditMode: widget.spotEditMode,
+                      newSpotRadius: widget.newSpotRadius,
+                      selectedSpotIndex: widget.selectedSpotIndex,
+                      activeStrokeNorm: List<Offset>.from(_activeStrokeNorm),
+                      redEyeEditMode: widget.redEyeEditMode,
+                      newRedEyeRadius: widget.newRedEyeRadius,
+                      hoverLocalPos: _hoverLocalPos,
+                      showRadiusGuide: _showRadiusGuide,
                     ),
                   ),
                 ),
@@ -540,6 +912,13 @@ class _ViewportPainter extends CustomPainter {
   final Offset? horizonStart;
   final Offset? horizonEnd;
   final bool spotEditMode;
+  final double newSpotRadius;
+  final int? selectedSpotIndex;
+  final List<Offset> activeStrokeNorm;
+  final bool redEyeEditMode;
+  final double newRedEyeRadius;
+  final Offset? hoverLocalPos;
+  final bool showRadiusGuide;
 
   _ViewportPainter({
     required this.processedImage,
@@ -551,6 +930,13 @@ class _ViewportPainter extends CustomPainter {
     required this.horizonStart,
     required this.horizonEnd,
     required this.spotEditMode,
+    required this.newSpotRadius,
+    required this.selectedSpotIndex,
+    required this.activeStrokeNorm,
+    required this.redEyeEditMode,
+    required this.newRedEyeRadius,
+    required this.hoverLocalPos,
+    required this.showRadiusGuide,
   });
 
   @override
@@ -563,7 +949,7 @@ class _ViewportPainter extends CustomPainter {
       processedImage.width.toDouble(),
       processedImage.height.toDouble(),
     );
-    final paint = Paint()..filterQuality = FilterQuality.medium;
+    final paint = Paint()..filterQuality = FilterQuality.high;
 
     // 1. 처리된 결과 이미지 그리기
     canvas.drawImageRect(processedImage, srcRect, imgRect, paint);
@@ -682,10 +1068,13 @@ class _ViewportPainter extends CustomPainter {
       );
     }
 
-    // 6. 잡티 제거(Spot Removal) 원 오버레이
-    if (spotEditMode && params.spots.isNotEmpty) {
-      final maxDim = math.max(imgRect.width, imgRect.height);
-      for (final s in params.spots) {
+    final maxDim = math.max(imgRect.width, imgRect.height);
+
+    // 6. 스팟 리무버(Spot Remover) 원/브러시 모양 오버레이 및 라이브 브러시 가이드
+    if (spotEditMode) {
+      for (int i = 0; i < params.spots.length; i++) {
+        final s = params.spots[i];
+        final isSel = (i == selectedSpotIndex);
         final targetPt = Offset(
           imgRect.left + s.x * imgRect.width,
           imgRect.top + s.y * imgRect.height,
@@ -694,33 +1083,275 @@ class _ViewportPainter extends CustomPainter {
           imgRect.left + s.srcX * imgRect.width,
           imgRect.top + s.srcY * imgRect.height,
         );
-        final rPx = math.max(6.0, s.r * maxDim);
+        final rPx = math.max(5.0, s.r * maxDim);
 
+        // 소스(파란 모양) ↔ 타겟(주황 모양) 연결선
         canvas.drawLine(
           srcPt,
           targetPt,
           Paint()
-            ..color = const Color(0xAA44DDFF)
-            ..strokeWidth = 1.2,
+            ..color = isSel ? const Color(0xEE55EEFF) : const Color(0x8844DDFF)
+            ..strokeWidth = isSel ? 1.8 : 1.2,
         );
+
+        if (s.path.length >= 2) {
+          final offX = s.srcX - s.x;
+          final offY = s.srcY - s.y;
+          final targetScreenPts = <Offset>[
+            for (final pt in s.path)
+              Offset(
+                imgRect.left + pt[0] * imgRect.width,
+                imgRect.top + pt[1] * imgRect.height,
+              ),
+          ];
+          final srcScreenPts = <Offset>[
+            for (final pt in s.path)
+              Offset(
+                imgRect.left + (pt[0] + offX) * imgRect.width,
+                imgRect.top + (pt[1] + offY) * imgRect.height,
+              ),
+          ];
+          _drawHollowCapsuleStroke(
+            canvas,
+            targetScreenPts,
+            rPx,
+            borderColor:
+                isSel ? const Color(0xFFFFB838) : const Color(0xCCE8A838),
+            fillColor:
+                isSel ? const Color(0x28E8A838) : const Color(0x12E8A838),
+            borderWidth: isSel ? 2.4 : 1.6,
+          );
+          _drawHollowCapsuleStroke(
+            canvas,
+            srcScreenPts,
+            rPx,
+            borderColor:
+                isSel ? const Color(0xFF55EEFF) : const Color(0xAA44DDFF),
+            fillColor:
+                isSel ? const Color(0x2444DDFF) : const Color(0x1044DDFF),
+            borderWidth: isSel ? 2.2 : 1.4,
+          );
+        } else {
+          // 단일 원형 스팟
+          if (isSel) {
+            canvas.drawCircle(
+              targetPt,
+              rPx,
+              Paint()..color = const Color(0x28E8A838),
+            );
+          }
+          canvas.drawCircle(
+            targetPt,
+            rPx,
+            Paint()
+              ..color =
+                  isSel ? const Color(0xFFFFB838) : const Color(0xCCE8A838)
+              ..strokeWidth = isSel ? 2.4 : 1.6
+              ..style = PaintingStyle.stroke,
+          );
+          if (isSel) {
+            canvas.drawCircle(
+              srcPt,
+              rPx,
+              Paint()..color = const Color(0x2444DDFF),
+            );
+          }
+          canvas.drawCircle(
+            srcPt,
+            rPx,
+            Paint()
+              ..color =
+                  isSel ? const Color(0xFF55EEFF) : const Color(0xAA44DDFF)
+              ..strokeWidth = isSel ? 2.2 : 1.3
+              ..style = PaintingStyle.stroke,
+          );
+        }
+
+        // 중심 이동 핸들 점
         canvas.drawCircle(
           targetPt,
-          rPx,
-          Paint()
-            ..color = const Color(0xFFE8A838)
-            ..strokeWidth = 1.8
-            ..style = PaintingStyle.stroke,
+          isSel ? 4.2 : 2.8,
+          Paint()..color = const Color(0xFFFFB838),
         );
         canvas.drawCircle(
           srcPt,
+          isSel ? 4.2 : 2.8,
+          Paint()..color = const Color(0xFF55EEFF),
+        );
+      }
+
+      // 현재 마우스로 드래그하며 그리고 있는 실시간 브러시 모양 표시
+      if (activeStrokeNorm.isNotEmpty) {
+        final rPx = math.max(5.0, newSpotRadius * maxDim);
+        final pts = <Offset>[
+          for (final p in activeStrokeNorm)
+            Offset(
+              imgRect.left + p.dx * imgRect.width,
+              imgRect.top + p.dy * imgRect.height,
+            ),
+        ];
+        _drawHollowCapsuleStroke(
+          canvas,
+          pts,
           rPx,
+          borderColor: const Color(0xFFFFD066),
+          fillColor: const Color(0x44FFB838),
+          borderWidth: 2.2,
+        );
+      }
+
+      // 브러시 크기 미리보기 원 (마우스 커서 위치 또는 슬라이더 조절 중 화면 중앙)
+      final previewCenter = hoverLocalPos ??
+          (showRadiusGuide ? imgRect.center : null);
+      if (previewCenter != null && imgRect.contains(previewCenter)) {
+        final previewR = math.max(4.0, newSpotRadius * maxDim);
+        canvas.drawCircle(
+          previewCenter,
+          previewR,
+          Paint()..color = const Color(0x22FFFFFF),
+        );
+        canvas.drawCircle(
+          previewCenter,
+          previewR,
           Paint()
-            ..color = const Color(0xAA44DDFF)
-            ..strokeWidth = 1.2
+            ..color = const Color(0xEEFFFFFF)
+            ..strokeWidth = 1.6
+            ..style = PaintingStyle.stroke,
+        );
+        canvas.drawCircle(
+          previewCenter,
+          previewR,
+          Paint()
+            ..color = const Color(0xAA000000)
+            ..strokeWidth = 0.7
             ..style = PaintingStyle.stroke,
         );
       }
     }
+
+    // 7. 적목 제거(Red-Eye) 원 오버레이 및 라이브 브러시 모양 가이드
+    if (redEyeEditMode) {
+      for (final re in params.redEyes) {
+        final pt = Offset(
+          imgRect.left + re.x * imgRect.width,
+          imgRect.top + re.y * imgRect.height,
+        );
+        final rPx = math.max(5.0, re.r * maxDim);
+        canvas.drawCircle(
+          pt,
+          rPx,
+          Paint()..color = const Color(0x22FF4444),
+        );
+        canvas.drawCircle(
+          pt,
+          rPx,
+          Paint()
+            ..color = const Color(0xEEFF5555)
+            ..strokeWidth = 1.8
+            ..style = PaintingStyle.stroke,
+        );
+        canvas.drawCircle(
+          pt,
+          3.0,
+          Paint()..color = const Color(0xFFFF5555),
+        );
+      }
+
+      final previewCenter = hoverLocalPos ??
+          (showRadiusGuide ? imgRect.center : null);
+      if (previewCenter != null && imgRect.contains(previewCenter)) {
+        final previewR = math.max(4.0, newRedEyeRadius * maxDim);
+        canvas.drawCircle(
+          previewCenter,
+          previewR,
+          Paint()..color = const Color(0x24FF4444),
+        );
+        canvas.drawCircle(
+          previewCenter,
+          previewR,
+          Paint()
+            ..color = const Color(0xEEFF6666)
+            ..strokeWidth = 1.6
+            ..style = PaintingStyle.stroke,
+        );
+      }
+    }
+  }
+
+  /// 브러시로 드래그한 궤적(pts)을 내부 겹침선 없이 깔끔한 단일 캡슐 테두리 모양으로 렌더링
+  void _drawHollowCapsuleStroke(
+    Canvas canvas,
+    List<Offset> pts,
+    double rPx, {
+    required Color borderColor,
+    required Color fillColor,
+    required double borderWidth,
+  }) {
+    if (pts.isEmpty) return;
+    if (pts.length == 1) {
+      canvas.drawCircle(pts.first, rPx, Paint()..color = fillColor);
+      canvas.drawCircle(
+        pts.first,
+        rPx,
+        Paint()
+          ..color = borderColor
+          ..strokeWidth = borderWidth
+          ..style = PaintingStyle.stroke,
+      );
+      return;
+    }
+
+    var minX = pts.first.dx, maxX = pts.first.dx;
+    var minY = pts.first.dy, maxY = pts.first.dy;
+    final path = Path()..moveTo(pts.first.dx, pts.first.dy);
+    for (int i = 1; i < pts.length; i++) {
+      final p = pts[i];
+      path.lineTo(p.dx, p.dy);
+      if (p.dx < minX) minX = p.dx;
+      if (p.dx > maxX) maxX = p.dx;
+      if (p.dy < minY) minY = p.dy;
+      if (p.dy > maxY) maxY = p.dy;
+    }
+    final pad = rPx + borderWidth + 4.0;
+    final bounds = Rect.fromLTRB(minX - pad, minY - pad, maxX + pad, maxY + pad);
+
+    // 1. 반투명 내부 채움 레이어
+    canvas.saveLayer(bounds, Paint());
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = fillColor
+        ..strokeWidth = rPx * 2.0
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..style = PaintingStyle.stroke,
+    );
+    canvas.restore();
+
+    // 2. 외곽선만 남기는 중공(Hollow) 캡슐 테두리 레이어
+    canvas.saveLayer(bounds, Paint());
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = borderColor
+        ..strokeWidth = rPx * 2.0
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..style = PaintingStyle.stroke,
+    );
+    final innerDiameter = math.max(0.0, rPx * 2.0 - borderWidth * 2.0);
+    if (innerDiameter > 0.5) {
+      canvas.drawPath(
+        path,
+        Paint()
+          ..blendMode = BlendMode.clear
+          ..strokeWidth = innerDiameter
+          ..strokeCap = StrokeCap.round
+          ..strokeJoin = StrokeJoin.round
+          ..style = PaintingStyle.stroke,
+      );
+    }
+    canvas.restore();
   }
 
   void _drawBadge(Canvas canvas, Offset topLeft, String text) {

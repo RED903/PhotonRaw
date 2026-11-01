@@ -46,7 +46,7 @@ class PhotonRawApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PhotonRaw v1.0.6 — Pro RAW & Photo Darkroom',
+      title: 'PhotonRaw v1.0.9 — Pro RAW & Photo Darkroom',
       debugShowCheckedModeBanner: false,
       // Windows flutter_windows.dll(0x3c1ca) AccessibilityBridge AXTree 크래시 원천 차단을 위해 Semantics 트리 비활성화
       builder: (context, child) => ExcludeSemantics(
@@ -113,14 +113,14 @@ _DecodedFileBundle _decodeFileBundleTopLevel(String filePath) {
     decoded.rgb,
     decoded.width,
     decoded.height,
-    1150,
+    2400,
     decoded.linearRgb,
   );
   final fastProxy = makeProxy(
     qualityProxy.rgb,
     qualityProxy.width,
     qualityProxy.height,
-    560,
+    512,
     qualityProxy.linearRgb,
   );
   final thumbProxy = makeProxy(
@@ -302,7 +302,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   Timer? _qualityDebounceTimer;
 
   bool _isLoadingFile = false;
-  String _statusMessage = '준비 완료 (v1.0.8) — 사진 또는 RAW 파일을 열어주세요';
+  String _statusMessage = '준비 완료 (v1.0.9) — 사진 또는 RAW 파일을 열어주세요';
 
   // 우측 모듈 필터 및 검색 상태 (SemiDarktable 6개 카테고리 탭과 동일)
   String _activeCategory = 'all'; // 'all', 'active', 'tone', 'color', 'geometry', 'detail'
@@ -327,6 +327,11 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   bool _wbPickerMode = false;
   bool _spotEditMode = false;
   double _newSpotRadius = 0.025;
+  int? _selectedSpotIndex;
+  int _spotVariantCounter = 0;
+  bool _redEyeEditMode = false;
+  double _newRedEyeRadius = 0.025;
+  double _newRedEyeStrength = 0.85;
   bool _softProofJpeg = false;
   bool _filmstripCollapsed = false;
 
@@ -523,7 +528,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
 
     if (fast) {
       _qualityDebounceTimer?.cancel();
-      _qualityDebounceTimer = Timer(const Duration(milliseconds: 200), () {
+      _qualityDebounceTimer = Timer(const Duration(milliseconds: 260), () {
         if (mounted && _currentPhoto != null) {
           _triggerRender(fast: false);
         }
@@ -541,6 +546,11 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       bool useFast = fast;
       do {
         _hasPendingRender = false;
+        // S-커브, 컬러 이퀄라이저, 슬라이더 UI가 먼저 즉시(0ms) 화면에 그려지도록 이벤트 루프 양보
+        if (useFast) {
+          await Future<void>.delayed(Duration.zero);
+          if (!mounted) break;
+        }
         final cur = _currentPhoto;
         if (cur == null) break;
 
@@ -712,9 +722,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
     setState(() {
       photo.params.wbEnabled = true;
       photo.params.wbTemperature = wbRes.temp.toDouble();
-      photo.params.wbTint = wbRes.tint;
-      _statusMessage =
-          '자동 WB 적용됨: ${wbRes.temp}K, Tint ${wbRes.tint.toStringAsFixed(2)}';
+      _statusMessage = '자동 WB 적용됨: ${wbRes.temp}K (틴트 수동 유지)';
     });
     _triggerRender(fast: false);
   }
@@ -756,9 +764,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       _wbPickerMode = false;
       photo.params.wbEnabled = true;
       photo.params.wbTemperature = wbRes.temp.toDouble();
-      photo.params.wbTint = wbRes.tint;
-      _statusMessage =
-          '스포이드 WB 적용됨: ${wbRes.temp}K, Tint ${wbRes.tint.toStringAsFixed(2)}';
+      _statusMessage = '스포이드 WB 적용됨: ${wbRes.temp}K (틴트 수동 유지)';
     });
     _triggerRender(fast: false);
   }
@@ -1300,7 +1306,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.8',
+                '⚡ PhotonRaw v1.0.9',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -1464,6 +1470,40 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           wbPickerMode: _wbPickerMode,
           spotEditMode: _spotEditMode,
           newSpotRadius: _newSpotRadius,
+          selectedSpotIndex: _selectedSpotIndex,
+          onSelectedSpotChanged: (idx) {
+            setState(() => _selectedSpotIndex = idx);
+          },
+          onResolveSmartSpotSource: (tx, ty, r) {
+            if (_currentPhoto == null) {
+              final off = (r * 2.4).clamp(0.025, 0.16);
+              return (
+                (tx + off <= 0.96 ? tx + off : tx - off).clamp(0.02, 0.98),
+                ty.clamp(0.02, 0.98),
+              );
+            }
+            return findBestSpotSource(
+              _currentPhoto!.fastProxy,
+              _params,
+              tx,
+              ty,
+              r,
+              variantIndex: 0,
+            );
+          },
+          redEyeEditMode: _redEyeEditMode,
+          newRedEyeRadius: _newRedEyeRadius,
+          newRedEyeStrength: _newRedEyeStrength,
+          onRedEyesChanged: (redEyes) {
+            _pushUndoSnapshot();
+            _updateParams(
+              (p) {
+                p.redEyeEnabled = redEyes.isNotEmpty;
+                p.redEyes = redEyes;
+              },
+              fast: false,
+            );
+          },
           onOpenFileRequested: _pickAndLoadFiles,
           onSplitPositionChanged: (pos) {
             setState(() {
@@ -1492,6 +1532,10 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               (p) {
                 p.spotEnabled = spots.isNotEmpty;
                 p.spots = spots;
+                if (_selectedSpotIndex != null &&
+                    _selectedSpotIndex! >= spots.length) {
+                  _selectedSpotIndex = spots.isEmpty ? null : spots.length - 1;
+                }
               },
               fast: false,
             );
@@ -1608,7 +1652,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                         ('active', '활성'),
                         ('tone', '톤/노출'),
                         ('color', '색상'),
-                        ('geometry', '기하학'),
+                        ('geometry', '변형/복구'),
                         ('detail', '디테일'),
                       ])
                         Expanded(
@@ -1961,6 +2005,153 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                     ),
                   ),
               ],
+            ),
+          ],
+        ),
+      );
+    }
+
+    // 1-C. 스팟 리무버 (Spot Remover) — '변형/복구' 카테고리로 이동 및 라이트크래프트 방식 브러시/소스 수정 지원
+    if (_isModuleVisible(
+      title: '스팟 리무버 (Spot Remover 잡티 제거)',
+      category: 'geometry',
+      enabled: p.spotEnabled,
+    )) {
+      cards.add(
+        _buildCard(
+          title: '🩹 스팟 리무버 (Spot Remover)',
+          category: 'geometry',
+          enabled: p.spotEnabled,
+          initiallyExpanded: false,
+          onToggleEnabled: (v) => _updateParams(
+            (params) => params.spotEnabled = v,
+            recordUndo: true,
+            fast: false,
+          ),
+          onReset: () {
+            setState(() {
+              _spotEditMode = false;
+              _selectedSpotIndex = null;
+            });
+            _updateParams(
+              (params) {
+                params.spotEnabled = false;
+                params.spots = [];
+              },
+              recordUndo: true,
+              fast: false,
+            );
+          },
+          children: [
+            _smallBtn(
+              _spotEditMode
+                  ? '🖌️ 스팟 브러시 편집 중 (좌클릭 칠하기 / 원 이동 / 우클릭 삭제)'
+                  : '🖌️ 뷰포트에서 스팟 브러시 편집 시작',
+              () => setState(() {
+                _spotEditMode = !_spotEditMode;
+                if (_spotEditMode) {
+                  _cropEditMode = false;
+                  _horizonMode = false;
+                  _wbPickerMode = false;
+                  _redEyeEditMode = false;
+                }
+              }),
+              active: _spotEditMode,
+            ),
+            const SizedBox(height: 5),
+            const Text(
+              '• 빈 곳 클릭/드래그: 드래그한 궤적 모양 그대로 스팟 툴 생성 및 완전 대체\n'
+              '• 주황 테두리 드래그: 타겟 위치 수정 / 파란 테두리 드래그: 덮을 소스 위치 수정\n'
+              '• 마우스 휠 클릭 드래그(또는 두 손가락): 편집 중에도 화면 이동',
+              style: TextStyle(
+                fontSize: 10.5,
+                color: Color(0xFF9E9E9E),
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 6),
+            ControlSlider(
+              label: '브러시 크기 (Brush Size)',
+              value: _newSpotRadius,
+              min: 0.005,
+              max: 0.10,
+              defaultVal: 0.025,
+              decimals: 3,
+              onChanged: (v) {
+                // 브러시 크기를 줄이거나 늘려도 기존에 그려진 스팟들의 크기는 절대 변하지 않고 새로 그릴 브러시 크기만 변경
+                setState(() => _newSpotRadius = v);
+              },
+            ),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Expanded(
+                  child: _smallBtn('🔄 다른 소스 위치 찾기', () {
+                    if (p.spots.isEmpty || _currentPhoto == null) return;
+                    final idx = (_selectedSpotIndex != null &&
+                            _selectedSpotIndex! >= 0 &&
+                            _selectedSpotIndex! < p.spots.length)
+                        ? _selectedSpotIndex!
+                        : p.spots.length - 1;
+                    _spotVariantCounter++;
+                    final target = p.spots[idx];
+                    final nextSrc = findBestSpotSource(
+                      _currentPhoto!.fastProxy,
+                      p,
+                      target.x,
+                      target.y,
+                      target.r,
+                      variantIndex: _spotVariantCounter,
+                      ignoreSpotIndex: idx,
+                    );
+                    _updateParams(
+                      (params) {
+                        params.spots[idx].srcX = nextSrc.$1;
+                        params.spots[idx].srcY = nextSrc.$2;
+                      },
+                      recordUndo: true,
+                      fast: false,
+                    );
+                  }),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: _smallBtn('🗑 선택/마지막 스팟 삭제', () {
+                    if (p.spots.isEmpty) return;
+                    _updateParams(
+                      (params) {
+                        final removeIdx = (_selectedSpotIndex != null &&
+                                _selectedSpotIndex! >= 0 &&
+                                _selectedSpotIndex! < params.spots.length)
+                            ? _selectedSpotIndex!
+                            : params.spots.length - 1;
+                        params.spots.removeAt(removeIdx);
+                        _selectedSpotIndex = params.spots.isEmpty
+                            ? null
+                            : params.spots.length - 1;
+                        if (params.spots.isEmpty) params.spotEnabled = false;
+                      },
+                      recordUndo: true,
+                      fast: false,
+                    );
+                  }),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            SizedBox(
+              width: double.infinity,
+              child: _smallBtn('🧹 모든 스팟 초기화 (${p.spots.length})', () {
+                setState(() => _selectedSpotIndex = null);
+                _updateParams(
+                  (params) {
+                    params.spots.clear();
+                    params.spotEnabled = false;
+                  },
+                  recordUndo: true,
+                  fast: false,
+                );
+              }),
             ),
           ],
         ),
@@ -2355,51 +2546,6 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       );
     }
 
-    // 7. 안개 제거 (Dehaze)
-    if (_isModuleVisible(
-      title: '안개 제거 (Dehaze)',
-      category: 'tone',
-      enabled: p.dehazeEnabled,
-    )) {
-      cards.add(
-        _buildCard(
-          title: '🌫️ 안개 제거 (Dehaze)',
-          category: 'tone',
-          enabled: p.dehazeEnabled,
-          initiallyExpanded: false,
-          onToggleEnabled: (v) => _updateParams(
-            (params) => params.dehazeEnabled = v,
-            recordUndo: true,
-            fast: false,
-          ),
-          onReset: () => _updateParams(
-            (params) {
-              params.dehazeEnabled = false;
-              params.dhStrength = 0.0;
-            },
-            recordUndo: true,
-            fast: false,
-          ),
-          children: [
-            ControlSlider(
-              label: '안개 제거 강도 (Strength)',
-              value: p.dhStrength,
-              min: -100.0,
-              max: 100.0,
-              defaultVal: 0.0,
-              scale: 0.01,
-              decimals: 1,
-              onChangeStart: _pushUndoSnapshot,
-              onAutoTurnOn: () => p.dehazeEnabled = true,
-              onChanged: (v) =>
-                  _updateParams((params) => params.dhStrength = v),
-              onChangeEnd: () => _triggerRender(fast: false),
-            ),
-          ],
-        ),
-      );
-    }
-
     // 8. 화이트 밸런스 (White Balance)
     if (_isModuleVisible(
       title: '화이트 밸런스 (White Balance)',
@@ -2442,7 +2588,6 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                     _updateParams(
                       (params) {
                         params.wbTemperature = params.wbAsShotTemp;
-                        params.wbTint = params.wbAsShotTint;
                       },
                       recordUndo: true,
                       fast: false,
@@ -2728,57 +2873,77 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       );
     }
 
-    // 13. 로컬 콘트라스트 & 클래리티 (Local Contrast)
+    // 13. 텍스처 & 클래리티 & 디헤이즈 (Texture / Clarity / Dehaze 통합 모듈)
+    final effectPanelEnabled = p.localContrastEnabled || p.dehazeEnabled;
     if (_isModuleVisible(
-      title: '로컬 콘트라스트 & 클래리티 (Local Contrast)',
+      title: '텍스처 & 클래리티 & 디헤이즈 (Texture Clarity Dehaze 안개 제거)',
       category: 'detail',
-      enabled: p.localContrastEnabled,
+      enabled: effectPanelEnabled,
     )) {
       cards.add(
         _buildCard(
-          title: '🔍 로컬 콘트라스트 & 클래리티',
+          title: '✨ 텍스처 & 클래리티 & 디헤이즈',
           category: 'detail',
-          enabled: p.localContrastEnabled,
+          enabled: effectPanelEnabled,
           initiallyExpanded: false,
           onToggleEnabled: (v) => _updateParams(
-            (params) => params.localContrastEnabled = v,
+            (params) {
+              params.localContrastEnabled = v;
+              params.dehazeEnabled = v;
+            },
             recordUndo: true,
             fast: false,
           ),
           onReset: () => _updateParams(
             (params) {
               params.localContrastEnabled = false;
+              params.dehazeEnabled = false;
               params.lcDetail = 0.0;
               params.lcClarity = 0.0;
+              params.dhStrength = 0.0;
             },
             recordUndo: true,
             fast: false,
           ),
           children: [
             ControlSlider(
-              label: '미세 디테일 (Fine Detail)',
+              label: 'Texture (텍스처)',
               value: p.lcDetail,
-              min: 0.0,
+              min: -100.0,
               max: 100.0,
               defaultVal: 0.0,
               scale: 0.01,
-              decimals: 1,
+              decimals: 0,
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.localContrastEnabled = true,
               onChanged: (v) => _updateParams((params) => params.lcDetail = v),
               onChangeEnd: () => _triggerRender(fast: false),
             ),
             ControlSlider(
-              label: '클래리티 (Clarity)',
+              label: 'Clarity (클래리티)',
               value: p.lcClarity,
               min: -100.0,
               max: 100.0,
               defaultVal: 0.0,
               scale: 0.01,
-              decimals: 1,
+              decimals: 0,
               onChangeStart: _pushUndoSnapshot,
               onAutoTurnOn: () => p.localContrastEnabled = true,
               onChanged: (v) => _updateParams((params) => params.lcClarity = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: 'Dehaze (안개 제거)',
+              value: p.dhStrength,
+              min: -100.0,
+              max: 100.0,
+              defaultVal: 0.0,
+              scale: 0.01,
+              decimals: 0,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.dehazeEnabled = true,
+              onChanged: (v) =>
+                  _updateParams((params) => params.dhStrength = v),
               onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],
@@ -2891,29 +3056,29 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       );
     }
 
-    // 16. 잡티 제거 (Spot Removal)
+    // 16. 적목 제거 (Red Eye Correction) — 디테일 카테고리
     if (_isModuleVisible(
-      title: '잡티 제거 (Spot Removal)',
+      title: '적목 제거 (Red Eye)',
       category: 'detail',
-      enabled: p.spotEnabled,
+      enabled: p.redEyeEnabled,
     )) {
       cards.add(
         _buildCard(
-          title: '🩹 잡티 제거 (Spot Removal)',
+          title: '👁️ 적목 제거 (Red Eye)',
           category: 'detail',
-          enabled: p.spotEnabled,
+          enabled: p.redEyeEnabled,
           initiallyExpanded: false,
           onToggleEnabled: (v) => _updateParams(
-            (params) => params.spotEnabled = v,
+            (params) => params.redEyeEnabled = v,
             recordUndo: true,
             fast: false,
           ),
           onReset: () {
-            setState(() => _spotEditMode = false);
+            setState(() => _redEyeEditMode = false);
             _updateParams(
               (params) {
-                params.spotEnabled = false;
-                params.spots = [];
+                params.redEyeEnabled = false;
+                params.redEyes = [];
               },
               recordUndo: true,
               fast: false,
@@ -2921,32 +3086,65 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           },
           children: [
             _smallBtn(
-              _spotEditMode
-                  ? '🖌️ 잡티 편집 중 (클릭: 추가, 드래그: 이동, 우클릭: 삭제)'
-                  : '🖌️ 뷰포트에서 잡티 클릭 편집 시작',
-              () => setState(() => _spotEditMode = !_spotEditMode),
-              active: _spotEditMode,
+              _redEyeEditMode
+                  ? '👁️ 적목 브러시 편집 중 (눈동자 클릭/드래그, 우클릭: 삭제)'
+                  : '👁️ 뷰포트에서 적목 브러시 편집 시작',
+              () => setState(() {
+                _redEyeEditMode = !_redEyeEditMode;
+                if (_redEyeEditMode) {
+                  _spotEditMode = false;
+                  _cropEditMode = false;
+                  _horizonMode = false;
+                  _wbPickerMode = false;
+                }
+              }),
+              active: _redEyeEditMode,
             ),
             const SizedBox(height: 6),
             ControlSlider(
-              label: '브러시 반경 (Spot Radius)',
-              value: _newSpotRadius,
+              label: '브러시 크기 (Eye Radius)',
+              value: _newRedEyeRadius,
               min: 0.005,
-              max: 0.10,
+              max: 0.08,
               defaultVal: 0.025,
               decimals: 3,
-              onChanged: (v) => setState(() => _newSpotRadius = v),
+              onChanged: (v) {
+                setState(() => _newRedEyeRadius = v);
+              },
+            ),
+            ControlSlider(
+              label: '적목 억제 강도 (Strength)',
+              value: _newRedEyeStrength,
+              min: 10.0,
+              max: 100.0,
+              defaultVal: 85.0,
+              scale: 0.01,
+              decimals: 0,
+              suffix: '%',
+              onChanged: (v) {
+                setState(() => _newRedEyeStrength = v);
+                if (p.redEyes.isNotEmpty) {
+                  _updateParams((params) {
+                    for (final re in params.redEyes) {
+                      re.strength = v;
+                    }
+                  });
+                }
+              },
+              onChangeEnd: () => _triggerRender(fast: false),
             ),
             const SizedBox(height: 4),
             Row(
               children: [
                 Expanded(
-                  child: _smallBtn('마지막 스팟 삭제', () {
-                    if (p.spots.isEmpty) return;
+                  child: _smallBtn('마지막 적목 삭제', () {
+                    if (p.redEyes.isEmpty) return;
                     _updateParams(
                       (params) {
-                        params.spots.removeLast();
-                        if (params.spots.isEmpty) params.spotEnabled = false;
+                        params.redEyes.removeLast();
+                        if (params.redEyes.isEmpty) {
+                          params.redEyeEnabled = false;
+                        }
                       },
                       recordUndo: true,
                       fast: false,
@@ -2955,11 +3153,11 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 ),
                 const SizedBox(width: 6),
                 Expanded(
-                  child: _smallBtn('모든 스팟 초기화 (${p.spots.length})', () {
+                  child: _smallBtn('모든 적목 초기화 (${p.redEyes.length})', () {
                     _updateParams(
                       (params) {
-                        params.spots.clear();
-                        params.spotEnabled = false;
+                        params.redEyes.clear();
+                        params.redEyeEnabled = false;
                       },
                       recordUndo: true,
                       fast: false,

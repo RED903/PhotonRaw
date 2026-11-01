@@ -1,12 +1,14 @@
 import 'dart:convert';
 
-/// 스팟 리터칭 한 점 (모두 0~1 정규화 좌표)
+/// 스팟 리터칭 한 점 또는 자유 곡선 브러시 스트로크 (모두 0~1 정규화 좌표)
 class Spot {
   double x;
   double y;
   double r;
   double srcX;
   double srcY;
+  /// 브러시로 드래그하여 칠한 궤적 좌표 목록 (비어있거나 1개면 단일 원형 스팟)
+  List<List<double>> path;
 
   Spot({
     required this.x,
@@ -14,9 +16,19 @@ class Spot {
     this.r = 0.02,
     required this.srcX,
     required this.srcY,
-  });
+    List<List<double>>? path,
+  }) : path = path ?? [];
 
-  Spot clone() => Spot(x: x, y: y, r: r, srcX: srcX, srcY: srcY);
+  Spot clone() => Spot(
+        x: x,
+        y: y,
+        r: r,
+        srcX: srcX,
+        srcY: srcY,
+        path: [
+          for (final pt in path) [pt[0], pt[1]],
+        ],
+      );
 
   Map<String, dynamic> toMap() => {
         'x': x,
@@ -24,19 +36,64 @@ class Spot {
         'r': r,
         'src_x': srcX,
         'src_y': srcY,
+        if (path.isNotEmpty)
+          'path': [
+            for (final pt in path) [pt[0], pt[1]],
+          ],
       };
 
   factory Spot.fromMap(Map m) {
     final x = _d(m['x'], 0.5);
     final y = _d(m['y'], 0.5);
+    final rawPath = m['path'];
+    final parsedPath = <List<double>>[];
+    if (rawPath is List) {
+      for (final e in rawPath) {
+        if (e is List && e.length >= 2) {
+          parsedPath.add([_d(e[0], x), _d(e[1], y)]);
+        }
+      }
+    }
     return Spot(
       x: x,
       y: y,
       r: _d(m['r'], 0.02),
       srcX: _d(m['src_x'], x + 0.03),
       srcY: _d(m['src_y'], y),
+      path: parsedPath,
     );
   }
+}
+
+/// 적목 제거(Red-Eye) 한 점 (0~1 정규화 좌표)
+class RedEyeSpot {
+  double x;
+  double y;
+  double r;
+  double strength;
+
+  RedEyeSpot({
+    required this.x,
+    required this.y,
+    this.r = 0.025,
+    this.strength = 0.85,
+  });
+
+  RedEyeSpot clone() => RedEyeSpot(x: x, y: y, r: r, strength: strength);
+
+  Map<String, dynamic> toMap() => {
+        'x': x,
+        'y': y,
+        'r': r,
+        'strength': strength,
+      };
+
+  factory RedEyeSpot.fromMap(Map m) => RedEyeSpot(
+        x: _d(m['x'], 0.5),
+        y: _d(m['y'], 0.5),
+        r: _d(m['r'], 0.025),
+        strength: _d(m['strength'], 0.85),
+      );
 }
 
 double _d(dynamic v, double def) => v is num ? v.toDouble() : def;
@@ -157,6 +214,9 @@ class PipelineParams {
   bool spotEnabled = false;
   List<Spot> spots = [];
 
+  bool redEyeEnabled = false;
+  List<RedEyeSpot> redEyes = [];
+
   // 뷰
   bool splitViewEnabled = false;
   double splitPosition = 0.5;
@@ -234,6 +294,8 @@ class PipelineParams {
         'df_threshold': dfThreshold,
         'spot_enabled': spotEnabled,
         'spots': [for (final s in spots) s.toMap()],
+        'red_eye_enabled': redEyeEnabled,
+        'red_eyes': [for (final re in redEyes) re.toMap()],
         'split_view_enabled': splitViewEnabled,
         'split_position': splitPosition,
       };
@@ -340,6 +402,15 @@ class PipelineParams {
       spots = [
         for (final s in m['spots'] as List)
           if (s is Map) Spot.fromMap(s)
+      ];
+    }
+    if (m.containsKey('red_eye_enabled')) {
+      redEyeEnabled = _b(m['red_eye_enabled'], redEyeEnabled);
+    }
+    if (m['red_eyes'] is List) {
+      redEyes = [
+        for (final re in m['red_eyes'] as List)
+          if (re is Map) RedEyeSpot.fromMap(re)
       ];
     }
     if (m.containsKey('split_view_enabled')) splitViewEnabled = _b(m['split_view_enabled'], splitViewEnabled);
