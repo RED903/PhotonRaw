@@ -28,12 +28,12 @@ class _SelectiveCurvePanGestureRecognizer extends PanGestureRecognizer {
   }
 }
 
-/// SemiDarktable의 ToneCurveWidget 1:1 이식 (모바일 터치 & 스크롤 공존 최적화)
-/// - RGB / R / G / B 4채널 탭 지원
-/// - Fritsch-Carlson 단조 3차 스플라인 실시간 곡선 렌더링
-/// - 기존 제어점 터치 반경 대폭 확대(30px)로 기존 점이 잘 안 잡히고 새 점이 생기는 문제 해결
-/// - 제어점(30px) 또는 곡선 라인(26px) 근처 터치 시에만 스크롤을 차단하고 곡선을 조작하며,
-///   곡선에서 떨어진 빈 영역을 스와이프하면 부모 스크롤이 자연스럽게 동작
+/// SemiDarktable의 ToneCurveWidget (모바일 터치 완벽 최적화 버전)
+/// - RGB / R / G / B 4채널 지원
+/// - Fritsch-Carlson 단조 3차 스플라인 실시간 렌더링
+/// - 로컬 상태(_localCurves) 기반 동기화로 제스처 프레임 지연/레이스 컨디션 완벽 차단
+/// - 어디를 터치하든 터치한 바로 그 위치(섀도우/미드톤/하이라이트)에 점이 생겨 손가락을 따라 조작되며,
+///   오른쪽 위 끝점이 엉뚱하게 잡히는 현상 원천 해결
 class ToneCurveWidget extends StatefulWidget {
   final Map<String, List<List<double>>> curvePoints;
   final ValueChanged<Map<String, List<List<double>>>> onChanged;
@@ -57,70 +57,80 @@ class ToneCurveWidget extends StatefulWidget {
 class _ToneCurveWidgetState extends State<ToneCurveWidget>
     with AutomaticKeepAliveClientMixin {
   static const double _pad = 12.0;
-  // 중간 제어점은 손가락으로 잡기 쉽도록 반경을 넉넉하게(40px) 설정
   static const double _pointHitRadius = 40.0;
-  // 양 끝점은 중간 점 조작을 방해하지 않도록 더 작은 반경(24px)에서만 잡힘
-  static const double _endPointHitRadius = 24.0;
-  // 곡선 라인 근처 터치 인식 반경 — 이 범위 밖의 빈 영역은 스크롤 허용
-  static const double _curveLineHitRadius = 38.0;
+  static const double _endPointHitRadius = 22.0;
+  static const double _curveLineHitRadius = 40.0;
 
   String _activeChannel = 'rgb';
   int? _draggingIndex;
-  // 터치 시작 위치(드래그 시작 후 이동량에 의한 오차 없이 정확한 점 판정에 사용)
-  Offset? _downPos;
-  // 점을 잡은 위치와 점 중심의 차이(정규화 좌표) — 잡는 순간 점이 튀지 않도록 보정
+  bool _isDragging = false;
   Offset _grabOffset = Offset.zero;
+
   final DoubleTapTracker _doubleTap = DoubleTapTracker();
   bool _isDoubleTapGuard = false;
 
-
+  /// 레이스 컨디션을 막기 위해 위젯 내부에서 일관되게 유지하는 로컬 커브 포인트 맵
+  late Map<String, List<List<double>>> _localCurves;
 
   @override
   bool get wantKeepAlive => true;
 
-  List<List<double>> get _currentPoints {
-    final pts = widget.curvePoints[_activeChannel];
-    if (pts == null || pts.length < 2) {
-      return [
-        [0.0, 0.0],
-        [1.0, 1.0],
-      ];
-    }
-    return pts.map((p) => [p[0], p[1]]).toList();
+  @override
+  void initState() {
+    super.initState();
+    _localCurves = _cloneMap(widget.curvePoints);
   }
 
-  Map<String, List<List<double>>> _cloneAll() {
+  @override
+  void didUpdateWidget(covariant ToneCurveWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 사용자가 손가락으로 드래그하고 있는 도중에는 외부 re-build로 인해 상태가 덮어써지지 않도록 보호
+    if (!_isDragging) {
+      _localCurves = _cloneMap(widget.curvePoints);
+    }
+  }
+
+  Map<String, List<List<double>>> _cloneMap(Map<String, List<List<double>>> src) {
     final map = <String, List<List<double>>>{};
     for (final ch in ['rgb', 'r', 'g', 'b']) {
-      final src = widget.curvePoints[ch] ??
+      final list = src[ch] ??
           [
             [0.0, 0.0],
             [1.0, 1.0],
           ];
-      map[ch] = src.map((p) => [p[0], p[1]]).toList();
+      map[ch] = list.map((p) => [p[0], p[1]]).toList();
     }
     return map;
   }
 
+  List<List<double>> get _currentPoints {
+    final pts = _localCurves[_activeChannel];
+    if (pts == null || pts.length < 2) {
+      final fallback = [
+        [0.0, 0.0],
+        [1.0, 1.0],
+      ];
+      _localCurves[_activeChannel] = fallback;
+      return fallback;
+    }
+    return pts;
+  }
+
+  Map<String, List<List<double>>> _cloneAll() {
+    return _cloneMap(_localCurves);
+  }
+
   /// 터치 위치에서 잡을 제어점 선택.
-  /// - 양 끝점(0과 pts.length - 1)은 극단 모퉁이(norm.dx < 0.08 또는 > 0.92)에서만 잡히도록 철저히 격리하여,
-  /// 터치 위치에서 잡을 제어점 선택.
-  /// - 양 끝점(0과 pts.length - 1)은 극단 모퉁이(normX <= 0.08 또는 >= 0.92)에서만 잡히도록 철저히 격리하여,
-  ///   가운데나 일반 영역 터치 시 오른쪽 위 끝점이 잡히는 문제를 원천 차단합니다.
-  /// - 중간 제어점은 넉넉한 반경(44px)으로 우선 탐색합니다.
-  int? _findNearPoint(
-    Offset localPos,
-    Size size,
-    List<List<double>> pts, {
-    double hitRadius = _pointHitRadius,
-  }) {
+  /// 1. 중간 제어점을 40px 반경 안에서 우선 탐색
+  /// 2. 양 끝점은 X가 극단 가장자리(X <= 5% 또는 X >= 95%)일 때만 선택 허용
+  int? _findNearPoint(Offset localPos, Size size, List<List<double>> pts) {
     final w = (size.width - _pad * 2).clamp(1.0, 10000.0);
     final h = (size.height - _pad * 2).clamp(1.0, 10000.0);
     final normX = ((localPos.dx - _pad) / w).clamp(0.0, 1.0);
 
     // 1순위: 중간 제어점 우선 탐색
     int? bestMid;
-    double bestMidDist = hitRadius;
+    double bestMidDist = _pointHitRadius;
     for (int i = 1; i < pts.length - 1; i++) {
       final px = _pad + pts[i][0] * w;
       final py = _pad + (1.0 - pts[i][1]) * h;
@@ -132,15 +142,15 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     }
     if (bestMid != null) return bestMid;
 
-    // 2순위: 양 끝점은 화면 가장자리 극단 영역(X < 8% 또는 X > 92%)일 때만 조작 허용
-    if (normX <= 0.08) {
+    // 2순위: 양 끝점은 극단 가장자리(X <= 0.05 또는 X >= 0.95)에서만 선택 허용
+    if (normX <= 0.05) {
       final p0x = _pad + pts[0][0] * w;
       final p0y = _pad + (1.0 - pts[0][1]) * h;
       if ((Offset(p0x, p0y) - localPos).distance <= _endPointHitRadius) {
         return 0;
       }
     }
-    if (normX >= 0.92) {
+    if (normX >= 0.95) {
       final lastIdx = pts.length - 1;
       final pLastX = _pad + pts[lastIdx][0] * w;
       final pLastY = _pad + (1.0 - pts[lastIdx][1]) * h;
@@ -153,11 +163,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
   }
 
   /// 터치 위치에서 현재 활성 채널 스플라인 곡선까지의 최소 거리(px) 계산
-  double _distanceToCurve(
-    Offset localPos,
-    Size size,
-    List<List<double>> pts,
-  ) {
+  double _distanceToCurve(Offset localPos, Size size, List<List<double>> pts) {
     final w = (size.width - _pad * 2).clamp(1.0, 10000.0);
     final h = (size.height - _pad * 2).clamp(1.0, 10000.0);
     final lut = evaluateMonotoneCubicSpline(pts, 64);
@@ -192,9 +198,9 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
   }
 
   void _handlePointerDown(PointerDownEvent event, Size size) {
-    _downPos = event.localPosition;
     if (_doubleTap.onPointerDown(event)) {
       _isDoubleTapGuard = true;
+      _isDragging = false;
       _draggingIndex = null;
       _handleDoubleTapAt(event.localPosition, size);
       Future.delayed(const Duration(milliseconds: 200), () {
@@ -212,11 +218,11 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     // 1순위: 확대된 반경 내의 기존 중간 제어점 또는 모퉁이 끝점 확인
     int? hit = _findNearPoint(pos, size, pts);
 
-    // 2순위: X좌표가 특정 중간 제어점과 매우 가까운 경우(6% 이내) 그 제어점 선택
+    // 2순위: 터치 위치의 X좌표가 기존 중간 제어점과 가까운 경우(5% 이내) 그 점을 선택
     if (hit == null) {
       for (int i = 1; i < pts.length - 1; i++) {
         final dx = (pts[i][0] - norm.dx).abs();
-        if (dx < 0.06 && (pts[i][1] - norm.dy).abs() < 0.35) {
+        if (dx < 0.05 && (pts[i][1] - norm.dy).abs() < 0.35) {
           hit = i;
           break;
         }
@@ -227,13 +233,15 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     widget.onAutoTurnOn?.call();
 
     if (hit != null) {
-      // 기존 제어점 드래그
+      // 기존 제어점 잡기
       _grabOffset = Offset(pts[hit][0] - norm.dx, pts[hit][1] - norm.dy);
-      setState(() => _draggingIndex = hit);
+      _draggingIndex = hit;
+      _isDragging = true;
+      setState(() {});
     } else if (_distanceToCurve(pos, size, pts) <= _curveLineHitRadius) {
-      // 3순위: 곡선 근처를 터치했을 때, 터치한 X좌표(0.06 ~ 0.94)에 새로운 제어점 생성!
-      // 극단 모퉁이(0.06 이하 또는 0.94 이상)가 아닌 안전한 영역에 새 점이 생성되어 양 끝점이 잡히지 않음
-      final newX = norm.dx.clamp(0.06, 0.94);
+      // 3순위: 곡선 근처를 터치했을 때, 터치한 X좌표(0.05 ~ 0.95 사이)에 새로운 제어점 즉시 생성!
+      // 극단 모퉁이(0.05 이하, 0.95 이상)가 아닌 안전한 영역에 새 점이 생성되어 양 끝점이 절대 잡히지 않음
+      final newX = norm.dx.clamp(0.05, 0.95);
       final newY = norm.dy.clamp(0.0, 1.0);
       pts.add([newX, newY]);
       pts.sort((a, b) => a[0].compareTo(b[0]));
@@ -245,22 +253,21 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
         }
       }
       _grabOffset = Offset.zero;
-      setState(() => _draggingIndex = newIdx);
-      final updated = _cloneAll();
-      updated[_activeChannel] = pts;
-      widget.onChanged(updated);
+      _draggingIndex = newIdx;
+      _isDragging = true;
+      setState(() {});
+      widget.onChanged(_cloneAll());
     }
   }
 
   void _handlePanUpdate(DragUpdateDetails details, Size size) {
-    if (_isDoubleTapGuard) return;
+    if (_isDoubleTapGuard || !_isDragging) return;
     final idx = _draggingIndex;
     if (idx == null) return;
     final pts = _currentPoints;
     if (idx < 0 || idx >= pts.length) return;
 
     final norm = _posToNorm(details.localPosition, size);
-    // 잡았을 때의 차이를 유지해 점이 손가락 위치로 순간이동하지 않게 함
     double nx = (norm.dx + _grabOffset.dx).clamp(0.0, 1.0);
     final ny = (norm.dy + _grabOffset.dy).clamp(0.0, 1.0);
 
@@ -275,13 +282,12 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     }
 
     pts[idx] = [nx, ny];
-    final updated = _cloneAll();
-    updated[_activeChannel] = pts;
-    widget.onChanged(updated);
+    setState(() {});
+    widget.onChanged(_cloneAll());
   }
 
   void _handlePanEnd(DragEndDetails details) {
-    _downPos = null;
+    _isDragging = false;
     if (_draggingIndex != null) {
       setState(() => _draggingIndex = null);
     }
@@ -293,17 +299,18 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     widget.onAutoTurnOn?.call();
     final pts = _currentPoints;
     final hit = _findNearPoint(localPosition, size, pts);
-    final updated = _cloneAll();
     if (hit != null && hit > 0 && hit < pts.length - 1) {
+      // 제어점 더블탭 시 해당 제어점 삭제
       pts.removeAt(hit);
-      updated[_activeChannel] = pts;
     } else {
-      updated[_activeChannel] = [
+      // 그래프 빈 곳 더블탭 시 현재 채널 기본 직선으로 초기화
+      _localCurves[_activeChannel] = [
         [0.0, 0.0],
         [1.0, 1.0],
       ];
     }
-    widget.onChanged(updated);
+    setState(() {});
+    widget.onChanged(_cloneAll());
     widget.onChangeEnd?.call();
   }
 
@@ -372,12 +379,12 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
               child: InkWell(
                 onTap: () {
                   widget.onChangeStart?.call();
-                  final updated = _cloneAll();
-                  updated[_activeChannel] = [
+                  _localCurves[_activeChannel] = [
                     [0.0, 0.0],
                     [1.0, 1.0],
                   ];
-                  widget.onChanged(updated);
+                  setState(() {});
+                  widget.onChanged(_cloneAll());
                   widget.onChangeEnd?.call();
                 },
                 borderRadius: BorderRadius.circular(4),
@@ -450,7 +457,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
                   child: CustomPaint(
                     size: size,
                     painter: _ToneCurvePainter(
-                      allPoints: widget.curvePoints,
+                      allPoints: _localCurves,
                       activeChannel: _activeChannel,
                       activeColor: _channelColor(_activeChannel),
                       draggingIndex: _draggingIndex,
