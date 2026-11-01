@@ -70,10 +70,10 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
   Offset? _downPos;
   // 점을 잡은 위치와 점 중심의 차이(정규화 좌표) — 잡는 순간 점이 튀지 않도록 보정
   Offset _grabOffset = Offset.zero;
-  final DoubleTapTracker _doubleTap = DoubleTapTracker(
-    maxInterval: Duration(milliseconds: 450),
-    maxDistance: 44.0,
-  );
+  final DoubleTapTracker _doubleTap = DoubleTapTracker();
+  bool _isDoubleTapGuard = false;
+
+
 
   @override
   bool get wantKeepAlive => true;
@@ -103,40 +103,53 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
   }
 
   /// 터치 위치에서 잡을 제어점 선택.
-  /// 중간 점을 항상 우선하며, 중간 점이 반경 안에 없을 때만 양 끝점을 후보로 사용한다.
+  /// - 양 끝점(0과 pts.length - 1)은 극단 모퉁이(norm.dx < 0.08 또는 > 0.92)에서만 잡히도록 철저히 격리하여,
+  /// 터치 위치에서 잡을 제어점 선택.
+  /// - 양 끝점(0과 pts.length - 1)은 극단 모퉁이(normX <= 0.08 또는 >= 0.92)에서만 잡히도록 철저히 격리하여,
+  ///   가운데나 일반 영역 터치 시 오른쪽 위 끝점이 잡히는 문제를 원천 차단합니다.
+  /// - 중간 제어점은 넉넉한 반경(44px)으로 우선 탐색합니다.
   int? _findNearPoint(
     Offset localPos,
     Size size,
     List<List<double>> pts, {
-    double? hitRadius,
+    double hitRadius = _pointHitRadius,
   }) {
     final w = (size.width - _pad * 2).clamp(1.0, 10000.0);
     final h = (size.height - _pad * 2).clamp(1.0, 10000.0);
-    final midR = hitRadius ?? _pointHitRadius;
-    final endR = hitRadius != null
-        ? math.min(hitRadius, _endPointHitRadius)
-        : _endPointHitRadius;
+    final normX = ((localPos.dx - _pad) / w).clamp(0.0, 1.0);
 
+    // 1순위: 중간 제어점 우선 탐색
     int? bestMid;
-    double bestMidDist = midR;
-    int? bestEnd;
-    double bestEndDist = endR;
-    for (int i = 0; i < pts.length; i++) {
+    double bestMidDist = hitRadius;
+    for (int i = 1; i < pts.length - 1; i++) {
       final px = _pad + pts[i][0] * w;
       final py = _pad + (1.0 - pts[i][1]) * h;
       final d = (Offset(px, py) - localPos).distance;
-      final isEnd = i == 0 || i == pts.length - 1;
-      if (isEnd) {
-        if (d < bestEndDist) {
-          bestEndDist = d;
-          bestEnd = i;
-        }
-      } else if (d < bestMidDist) {
+      if (d < bestMidDist) {
         bestMidDist = d;
         bestMid = i;
       }
     }
-    return bestMid ?? bestEnd;
+    if (bestMid != null) return bestMid;
+
+    // 2순위: 양 끝점은 화면 가장자리 극단 영역(X < 8% 또는 X > 92%)일 때만 조작 허용
+    if (normX <= 0.08) {
+      final p0x = _pad + pts[0][0] * w;
+      final p0y = _pad + (1.0 - pts[0][1]) * h;
+      if ((Offset(p0x, p0y) - localPos).distance <= _endPointHitRadius) {
+        return 0;
+      }
+    }
+    if (normX >= 0.92) {
+      final lastIdx = pts.length - 1;
+      final pLastX = _pad + pts[lastIdx][0] * w;
+      final pLastY = _pad + (1.0 - pts[lastIdx][1]) * h;
+      if ((Offset(pLastX, pLastY) - localPos).distance <= _endPointHitRadius) {
+        return lastIdx;
+      }
+    }
+
+    return null;
   }
 
   /// 터치 위치에서 현재 활성 채널 스플라인 곡선까지의 최소 거리(px) 계산
@@ -161,7 +174,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     return minDist;
   }
 
-  /// 제어점 또는 곡선 라인 근처인지 판별
+  /// 제어점 또는 곡선 근처 터치인지 판별 (빈 배경 스와이프 시에는 부모 스크롤 허용)
   bool _isInteractiveTouch(Offset localPos, Size size) {
     final pts = _currentPoints;
     if (_findNearPoint(localPos, size, pts) != null) {
@@ -181,53 +194,57 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
   void _handlePointerDown(PointerDownEvent event, Size size) {
     _downPos = event.localPosition;
     if (_doubleTap.onPointerDown(event)) {
+      _isDoubleTapGuard = true;
       _draggingIndex = null;
       _handleDoubleTapAt(event.localPosition, size);
+      Future.delayed(const Duration(milliseconds: 200), () {
+        if (mounted) _isDoubleTapGuard = false;
+      });
     }
   }
 
   void _handlePanStart(DragStartDetails details, Size size) {
+    if (_isDoubleTapGuard) return;
     final pts = _currentPoints;
-    // 드래그 인식 후 이동한 위치가 아니라 실제 터치를 시작한 위치로 판정
-    final pos = _downPos ?? details.localPosition;
+    final pos = details.localPosition;
     final norm = _posToNorm(pos, size);
 
-    // 1순위: 확대된 반경 내의 중간 제어점 → 2순위: 양 끝점(작은 반경)
+    // 1순위: 확대된 반경 내의 기존 중간 제어점 또는 모퉁이 끝점 확인
     int? hit = _findNearPoint(pos, size, pts);
 
-    // 3순위: 중간 제어점과 X좌표가 가까운 경우(5% 이내) 새 점을 만들지 않고 기존 점을 잡음
+    // 2순위: X좌표가 특정 중간 제어점과 매우 가까운 경우(6% 이내) 그 제어점 선택
     if (hit == null) {
-      int? bestIdx;
-      double bestDx = 0.05;
       for (int i = 1; i < pts.length - 1; i++) {
         final dx = (pts[i][0] - norm.dx).abs();
-        if (dx < bestDx && (pts[i][1] - norm.dy).abs() < 0.2) {
-          bestDx = dx;
-          bestIdx = i;
+        if (dx < 0.06 && (pts[i][1] - norm.dy).abs() < 0.35) {
+          hit = i;
+          break;
         }
       }
-      hit = bestIdx;
     }
 
     widget.onChangeStart?.call();
     widget.onAutoTurnOn?.call();
 
     if (hit != null) {
+      // 기존 제어점 드래그
       _grabOffset = Offset(pts[hit][0] - norm.dx, pts[hit][1] - norm.dy);
       setState(() => _draggingIndex = hit);
     } else if (_distanceToCurve(pos, size, pts) <= _curveLineHitRadius) {
-      _grabOffset = Offset.zero;
-      pts.add([norm.dx, norm.dy]);
+      // 3순위: 곡선 근처를 터치했을 때, 터치한 X좌표(0.06 ~ 0.94)에 새로운 제어점 생성!
+      // 극단 모퉁이(0.06 이하 또는 0.94 이상)가 아닌 안전한 영역에 새 점이 생성되어 양 끝점이 잡히지 않음
+      final newX = norm.dx.clamp(0.06, 0.94);
+      final newY = norm.dy.clamp(0.0, 1.0);
+      pts.add([newX, newY]);
       pts.sort((a, b) => a[0].compareTo(b[0]));
-      int newIdx = 0;
-      double minDiff = 999.0;
-      for (int i = 0; i < pts.length; i++) {
-        final d = (pts[i][0] - norm.dx).abs() + (pts[i][1] - norm.dy).abs();
-        if (d < minDiff) {
-          minDiff = d;
+      int newIdx = 1;
+      for (int i = 1; i < pts.length - 1; i++) {
+        if ((pts[i][0] - newX).abs() < 1e-4) {
           newIdx = i;
+          break;
         }
       }
+      _grabOffset = Offset.zero;
       setState(() => _draggingIndex = newIdx);
       final updated = _cloneAll();
       updated[_activeChannel] = pts;
@@ -236,6 +253,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
   }
 
   void _handlePanUpdate(DragUpdateDetails details, Size size) {
+    if (_isDoubleTapGuard) return;
     final idx = _draggingIndex;
     if (idx == null) return;
     final pts = _currentPoints;
@@ -263,6 +281,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
   }
 
   void _handlePanEnd(DragEndDetails details) {
+    _downPos = null;
     if (_draggingIndex != null) {
       setState(() => _draggingIndex = null);
     }

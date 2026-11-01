@@ -71,6 +71,7 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
   late String _internalMode;
   int? _selectedBand;
   final DoubleTapTracker _doubleTap = DoubleTapTracker();
+  bool _isDoubleTapGuard = false;
 
   @override
   bool get wantKeepAlive => true;
@@ -230,7 +231,13 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
     double height,
   ) {
     if (_doubleTap.onPointerDown(event)) {
+      // 더블탭 즉시 제스처 Pan이 값을 덮어쓰지 못하도록 가드 설정
+      _isDoubleTapGuard = true;
+      _selectedBand = null;
       _handleDoubleTapAt(event.localPosition, width, height);
+      Future.delayed(const Duration(milliseconds: 200), () {
+        if (mounted) _isDoubleTapGuard = false;
+      });
     }
   }
 
@@ -345,6 +352,7 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
                       instance.shouldClaimImmediately =
                           (pos) => _isInteractiveTouch(pos, w, h);
                       instance.onStart = (d) {
+                        if (_isDoubleTapGuard) return;
                         widget.onChangeStart?.call();
                         widget.onAutoTurnOn?.call();
                         final band = _hitTestBand(d.localPosition, w, h);
@@ -354,6 +362,7 @@ class _ColorEqualizerWidgetState extends State<ColorEqualizerWidget>
                         _emitUpdated(updated);
                       };
                       instance.onUpdate = (d) {
+                        if (_isDoubleTapGuard) return;
                         final band = _selectedBand;
                         if (band != null) {
                           final updated = _currentValues;

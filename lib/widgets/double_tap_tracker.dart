@@ -2,29 +2,22 @@ import 'package:flutter/gestures.dart';
 
 /// 모바일/데스크톱 공용 더블탭 추적기.
 ///
-/// - 첫 번째 터치는 '탭'(이동량이 작고 짧게 눌렀다 뗌)이어야 하며, 드래그 조작 직후의 터치는 더블탭으로 오인하지 않음
-/// - 두 번째 터치는 [maxInterval] 이내, 첫 탭 위치에서 [maxDistance] 이내면 더블탭으로 인정
-///   (손가락으로 정확히 같은 위치를 두 번 누르기 어려운 모바일을 위해 허용 거리를 넉넉하게 설정)
+/// - 모바일에서 손가락 터치 시 미세한 흔들림(이동)이 있어도 안전하게 더블탭 감지
+/// - 두 번의 탭(PointerDown) 간격이 [maxInterval] 이내이고, 거리 오차가 [maxDistance] 이내이면 더블탭 인정
+/// - 단, 1초 이상 길게 누르고 있었던 롱 드래그는 더블탭으로 오인하지 않음
 class DoubleTapTracker {
   final Duration maxInterval;
   final double maxDistance;
-  final double tapSlop;
-  final Duration maxTapDuration;
 
   DoubleTapTracker({
-    this.maxInterval = const Duration(milliseconds: 550),
-    this.maxDistance = 90.0,
-    this.tapSlop = 16.0,
-    this.maxTapDuration = const Duration(milliseconds: 400),
+    this.maxInterval = const Duration(milliseconds: 500),
+    this.maxDistance = 80.0,
   });
 
-  DateTime? _downTime;
-  Offset? _downPos;
-  bool _moved = false;
-  int? _activePointer;
-
-  DateTime? _lastTapUpTime;
-  Offset? _lastTapUpPos;
+  DateTime? _firstDownTime;
+  Offset? _firstDownPos;
+  int? _firstPointer;
+  bool _isLongPress = false;
 
   /// 포인터가 눌렸을 때 호출. 더블탭으로 판정되면 true 반환
   bool onPointerDown(PointerDownEvent e) {
@@ -33,52 +26,54 @@ class DoubleTapTracker {
       return false;
     }
     final now = DateTime.now();
-    _activePointer = e.pointer;
-    _downTime = now;
-    _downPos = e.localPosition;
-    _moved = false;
 
-    if (_lastTapUpTime != null &&
-        _lastTapUpPos != null &&
-        now.difference(_lastTapUpTime!) < maxInterval &&
-        (e.localPosition - _lastTapUpPos!).distance < maxDistance) {
-      _lastTapUpTime = null;
-      _lastTapUpPos = null;
-      // 이번 터치는 더블탭의 두 번째 터치이므로 추가 탭으로 쓰지 않음
-      _downTime = null;
+    // 이전 터치가 있고 유효 시간/거리 이내인 경우 -> 더블탭 인정!
+    if (_firstDownTime != null &&
+        _firstDownPos != null &&
+        !_isLongPress &&
+        now.difference(_firstDownTime!) < maxInterval &&
+        (e.localPosition - _firstDownPos!).distance < maxDistance) {
+      _firstDownTime = null;
+      _firstDownPos = null;
+      _firstPointer = null;
+      _isLongPress = false;
       return true;
     }
+
+    // 첫 번째 터치 기록
+    _firstDownTime = now;
+    _firstDownPos = e.localPosition;
+    _firstPointer = e.pointer;
+    _isLongPress = false;
     return false;
   }
 
   void onPointerMove(PointerMoveEvent e) {
-    if (e.pointer != _activePointer || _downPos == null) return;
-    if ((e.localPosition - _downPos!).distance > tapSlop) {
-      _moved = true;
+    // 이동량이 너무 크면(120px 초과 화면 횡단 드래그) 더블탭 후보 취소
+    if (e.pointer == _firstPointer && _firstDownPos != null) {
+      if ((e.localPosition - _firstDownPos!).distance > 120.0) {
+        _isLongPress = true;
+      }
     }
   }
 
   void onPointerUp(PointerUpEvent e) {
-    if (e.pointer != _activePointer) return;
-    final down = _downTime;
-    if (down != null &&
-        !_moved &&
-        DateTime.now().difference(down) < maxTapDuration) {
-      _lastTapUpTime = DateTime.now();
-      _lastTapUpPos = e.localPosition;
-    } else {
-      _lastTapUpTime = null;
-      _lastTapUpPos = null;
+    if (e.pointer == _firstPointer) {
+      // 550ms 이상 길게 누르고 있었던 드래그는 더블탭 대상에서 제외
+      if (_firstDownTime != null &&
+          DateTime.now().difference(_firstDownTime!) > const Duration(milliseconds: 550)) {
+        _firstDownTime = null;
+        _firstDownPos = null;
+      }
     }
-    _activePointer = null;
-    _downTime = null;
   }
 
   void onPointerCancel(PointerCancelEvent e) {
-    if (e.pointer != _activePointer) return;
-    _activePointer = null;
-    _downTime = null;
-    _lastTapUpTime = null;
-    _lastTapUpPos = null;
+    if (e.pointer == _firstPointer) {
+      _firstDownTime = null;
+      _firstDownPos = null;
+      _firstPointer = null;
+    }
   }
 }
+
