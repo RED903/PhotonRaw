@@ -997,8 +997,14 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
 
 // ───────────────────────── 스팟 리터칭 & 적목 제거 ─────────────────────────
 
-/// 타겟 위치 (tx, ty) 주변에서 경계 색상/휘도 연속성과 패치 내부 균일도가 가장 뛰어난 최적의 소스 좌표를 탐색합니다.
-/// [variantIndex]를 증가시키면 차선책 후보들을 순환하며 선택할 수 있습니다.
+/// 타겟(원 또는 드래그 스트로크 [path]) 주변에서 가장 자연스럽게 이어질 소스 좌표를 탐색합니다.
+///
+/// 알고리즘:
+/// 1. 타겟 형태를 반지름 간격으로 재샘플링하고, 형태 바깥 경계 링(1.35r)의 색을 기준값으로 수집
+/// 2. 24방향 × 여러 거리 후보 중 '이동시킨 형태가 원래 형태와 겹치지 않는' 후보만 사용
+///    (스트로크 길이를 고려해 최소 이동 거리를 자동으로 확보)
+/// 3. 경계 링 색 연속성(SSD) + 질감(분산) 유사도 + 패치 내부 균일도 + 거리 패널티로 점수화
+/// 4. 비슷한 위치의 중복 후보를 제거한 상위 후보를 [variantIndex]로 순환 선택
 (double, double) findBestSpotSource(
   ProxyImage src,
   PipelineParams p,
@@ -1007,6 +1013,7 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
   double r, {
   int variantIndex = 0,
   int? ignoreSpotIndex,
+  List<List<double>> path = const [],
 }) {
   final lin = srgb8ToLinear(src);
   final geo = applyGeometry(lin, p);
@@ -1015,112 +1022,241 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
   final buf = geo.data;
   final maxDim = math.max(w, h).toDouble();
   final rPx = math.max(3.0, r * maxDim);
+  final tcx = tx * w;
+  final tcy = ty * h;
 
-  // 타겟 외곽 링(1.05r ~ 1.35r)의 평균 색상 샘플링 (잡티 중심부 오염 배제)
-  var tR = 0.0, tG = 0.0, tB = 0.0;
-  var tCount = 0;
-  const ringSamples = 16;
-  for (var i = 0; i < ringSamples; i++) {
-    final ang = (2.0 * math.pi * i) / ringSamples;
-    final sx = (tx * w + math.cos(ang) * rPx * 1.15).round().clamp(0, w - 1);
-    final sy = (ty * h + math.sin(ang) * rPx * 1.15).round().clamp(0, h - 1);
-    final o = (sy * w + sx) * 3;
-    tR += buf[o];
-    tG += buf[o + 1];
-    tB += buf[o + 2];
-    tCount++;
-  }
-  if (tCount > 0) {
-    tR /= tCount;
-    tG /= tCount;
-    tB /= tCount;
-  }
-
-  final margin = (r * 1.3).clamp(0.02, 0.25);
-  final candidates = <(double score, double cx, double cy)>[];
-  final distMultipliers = [2.2, 3.2, 4.5, 6.0];
-  const dirs = 16;
-
-  for (final dm in distMultipliers) {
-    final distNorm = (r * dm).clamp(0.025, 0.35);
-    for (var d = 0; d < dirs; d++) {
-      final ang = (2.0 * math.pi * d) / dirs;
-      final aspect = w / math.max(1.0, h.toDouble());
-      final cx = tx + math.cos(ang) * distNorm / math.max(1.0, aspect);
-      final cy = ty + math.sin(ang) * distNorm * math.min(1.0, aspect);
-
-      if (cx < margin || cx > 1.0 - margin || cy < margin || cy > 1.0 - margin) {
-        continue;
+  // 1) 타겟 형태 샘플 (스트로크면 rPx*0.8 간격으로 재샘플링)
+  final shape = <(double, double)>[];
+  if (path.length >= 2) {
+    shape.add((path.first[0] * w, path.first[1] * h));
+    var acc = 0.0;
+    for (var i = 1; i < path.length; i++) {
+      final dx = (path[i][0] - path[i - 1][0]) * w;
+      final dy = (path[i][1] - path[i - 1][1]) * h;
+      acc += math.sqrt(dx * dx + dy * dy);
+      if (acc >= rPx * 0.8 || i == path.length - 1) {
+        shape.add((path[i][0] * w, path[i][1] * h));
+        acc = 0.0;
       }
+    }
+    if (shape.length > 40) {
+      final step = (shape.length / 40).ceil();
+      final reduced = <(double, double)>[];
+      for (var i = 0; i < shape.length; i += step) {
+        reduced.add(shape[i]);
+      }
+      shape
+        ..clear()
+        ..addAll(reduced);
+    }
+  } else {
+    shape.add((tcx, tcy));
+  }
 
-      // 기존 스팟 타겟 영역과 겹치는 후보는 회피
-      var overlaps = false;
-      for (var si = 0; si < p.spots.length; si++) {
-        if (si == ignoreSpotIndex) continue;
-        final ex = p.spots[si];
-        final dx = cx - ex.x;
-        final dy = cy - ex.y;
-        if (math.sqrt(dx * dx + dy * dy) < (r + ex.r) * 1.3) {
-          overlaps = true;
+  double minDistToShape(double x, double y) {
+    var best = double.infinity;
+    for (final s in shape) {
+      final dx = x - s.$1;
+      final dy = y - s.$2;
+      final d = dx * dx + dy * dy;
+      if (d < best) best = d;
+    }
+    return math.sqrt(best);
+  }
+
+  // 픽셀 값을 감마 근사(sqrt)로 읽어 밝은 영역이 점수를 지배하지 않도록 함
+  (double, double, double) sampleG(double x, double y) {
+    final px = x.round().clamp(0, w - 1);
+    final py = y.round().clamp(0, h - 1);
+    final o = (py * w + px) * 3;
+    return (
+      math.sqrt(math.max(0.0, buf[o])),
+      math.sqrt(math.max(0.0, buf[o + 1])),
+      math.sqrt(math.max(0.0, buf[o + 2])),
+    );
+  }
+
+  double lumOf((double, double, double) c) =>
+      c.$1 * 0.30 + c.$2 * 0.59 + c.$3 * 0.11;
+
+  // 2) 타겟 경계 링 샘플 및 기준 색/질감 수집
+  final ringPts = <(double, double)>[];
+  final ringR = rPx * 1.35;
+  for (final s in shape) {
+    for (var a = 0; a < 8; a++) {
+      final ang = a * math.pi / 4.0;
+      final px = s.$1 + math.cos(ang) * ringR;
+      final py = s.$2 + math.sin(ang) * ringR;
+      if (px < 0 || py < 0 || px > w - 1 || py > h - 1) continue;
+      if (minDistToShape(px, py) < rPx * 1.15) continue;
+      ringPts.add((px, py));
+    }
+  }
+  if (ringPts.length > 96) {
+    final step = (ringPts.length / 96).ceil();
+    final reduced = <(double, double)>[];
+    for (var i = 0; i < ringPts.length; i += step) {
+      reduced.add(ringPts[i]);
+    }
+    ringPts
+      ..clear()
+      ..addAll(reduced);
+  }
+  final ringVals = [for (final q in ringPts) sampleG(q.$1, q.$2)];
+  var tLumSum = 0.0, tLumSq = 0.0;
+  for (final c in ringVals) {
+    final l = lumOf(c);
+    tLumSum += l;
+    tLumSq += l * l;
+  }
+  final nRing = math.max(1, ringVals.length);
+  final tLumMean = tLumSum / nRing;
+  final varT = math.max(0.0, tLumSq / nRing - tLumMean * tLumMean);
+
+  // 3) 후보 탐색
+  final candidates = <(double score, double dx, double dy)>[];
+  const dirs = 24;
+  const distMul = [1.0, 1.25, 1.6, 2.0, 2.6, 3.4, 4.5, 6.0];
+  final baseDist = rPx * 2.4;
+  final minGap = rPx * 2.15;
+  final edgeMargin = rPx * 1.5;
+
+  for (final dm in distMul) {
+    final dist = baseDist * dm;
+    for (var d = 0; d < dirs; d++) {
+      // 방향마다 약간의 위상 오프셋을 주어 거리별 후보가 겹치지 않도록 함
+      final ang = (2.0 * math.pi * (d + (dm * 7.0) % 1.0 * 0.5)) / dirs;
+      final dx = math.cos(ang) * dist;
+      final dy = math.sin(ang) * dist;
+
+      // 이동한 형태가 화면 안쪽에 완전히 들어오는지
+      var inside = true;
+      for (final s in shape) {
+        final nx = s.$1 + dx;
+        final ny = s.$2 + dy;
+        if (nx < edgeMargin ||
+            ny < edgeMargin ||
+            nx > w - edgeMargin ||
+            ny > h - edgeMargin) {
+          inside = false;
           break;
         }
       }
-      if (overlaps) continue;
+      if (!inside) continue;
 
-      // 후보 패치의 평균 색상 및 내부 분산(평탄도) 계산
-      var cR = 0.0, cG = 0.0, cB = 0.0;
-      var cR2 = 0.0, cG2 = 0.0, cB2 = 0.0;
-      var cnt = 0;
-      for (var ring = 0; ring <= 2; ring++) {
-        final rad = rPx * (ring * 0.45);
-        final steps = ring == 0 ? 1 : 8;
-        for (var k = 0; k < steps; k++) {
-          final a = (2.0 * math.pi * k) / steps;
-          final px = (cx * w + math.cos(a) * rad).round().clamp(0, w - 1);
-          final py = (cy * h + math.sin(a) * rad).round().clamp(0, h - 1);
-          final o = (py * w + px) * 3;
-          final vr = buf[o].toDouble();
-          final vg = buf[o + 1].toDouble();
-          final vb = buf[o + 2].toDouble();
-          cR += vr;
-          cG += vg;
-          cB += vb;
-          cR2 += vr * vr;
-          cG2 += vg * vg;
-          cB2 += vb * vb;
-          cnt++;
+      // 이동한 형태가 원래 형태와 겹치지 않는지 (스트로크 길이 고려)
+      var overlapsSelf = false;
+      for (final a in shape) {
+        for (final b in shape) {
+          final ex = a.$1 + dx - b.$1;
+          final ey = a.$2 + dy - b.$2;
+          if (ex * ex + ey * ey < minGap * minGap) {
+            overlapsSelf = true;
+            break;
+          }
+        }
+        if (overlapsSelf) break;
+      }
+      if (overlapsSelf) continue;
+
+      // 기존 스팟 타겟과 겹치는 후보 회피
+      var overlapsOther = false;
+      for (var si = 0; si < p.spots.length && !overlapsOther; si++) {
+        if (si == ignoreSpotIndex) continue;
+        final ex = p.spots[si];
+        final exPx = ex.x * w;
+        final eyPx = ex.y * h;
+        final lim = (rPx + ex.r * maxDim) * 1.3;
+        for (final s in shape) {
+          final ddx = s.$1 + dx - exPx;
+          final ddy = s.$2 + dy - eyPx;
+          if (ddx * ddx + ddy * ddy < lim * lim) {
+            overlapsOther = true;
+            break;
+          }
         }
       }
-      if (cnt == 0) continue;
-      cR /= cnt;
-      cG /= cnt;
-      cB /= cnt;
-      final varR = math.max(0.0, cR2 / cnt - cR * cR);
-      final varG = math.max(0.0, cG2 / cnt - cG * cG);
-      final varB = math.max(0.0, cB2 / cnt - cB * cB);
-      final internalVariance = varR + varG + varB;
+      if (overlapsOther) continue;
 
-      // 타겟 주변부와의 색/휘도 차이
-      final dr = cR - tR;
-      final dg = cG - tG;
-      final db = cB - tB;
-      final colorDiff = dr * dr * 1.2 + dg * dg * 1.6 + db * db * 1.0;
+      // 경계 링 연속성(SSD) + 링 질감 분산
+      var ssd = 0.0;
+      var cLumSum = 0.0, cLumSq = 0.0;
+      for (var k = 0; k < ringPts.length; k++) {
+        final c = sampleG(ringPts[k].$1 + dx, ringPts[k].$2 + dy);
+        final t = ringVals[k];
+        final er = c.$1 - t.$1;
+        final eg = c.$2 - t.$2;
+        final eb = c.$3 - t.$3;
+        ssd += er * er * 1.2 + eg * eg * 1.6 + eb * eb;
+        final l = lumOf(c);
+        cLumSum += l;
+        cLumSq += l * l;
+      }
+      final cLumMean = cLumSum / nRing;
+      final varC = math.max(0.0, cLumSq / nRing - cLumMean * cLumMean);
 
-      // 가까울수록 약간의 가산점, 평탄하고 색이 비슷할수록 낮은 점수(우수)
-      final score = colorDiff * 3.0 + internalVariance * 1.8 + dm * 0.0015;
-      candidates.add((score, cx.clamp(0.02, 0.98), cy.clamp(0.02, 0.98)));
+      // 패치 내부(이동한 형태 중심선 + 반경 절반 위치)의 균일도
+      var iSum = 0.0, iSq = 0.0;
+      var iN = 0;
+      for (final s in shape) {
+        for (var a = 0; a < 5; a++) {
+          final rad = a == 0 ? 0.0 : rPx * 0.6;
+          final ang = a * math.pi / 2.0;
+          final c = sampleG(
+            s.$1 + dx + math.cos(ang) * rad,
+            s.$2 + dy + math.sin(ang) * rad,
+          );
+          final l = lumOf(c);
+          iSum += l;
+          iSq += l * l;
+          iN++;
+        }
+      }
+      final iMean = iSum / math.max(1, iN);
+      final varI = math.max(0.0, iSq / math.max(1, iN) - iMean * iMean);
+
+      final score = (ssd / nRing) * 4.0 +
+          (varC - varT).abs() * 2.0 +
+          (varI - varT).abs() * 1.5 +
+          (dist / maxDim) * 0.02;
+      candidates.add((score, dx, dy));
     }
   }
 
   if (candidates.isEmpty) {
-    final fallbackX = (tx + r * 2.4 <= 0.96) ? tx + r * 2.4 : tx - r * 2.4;
-    return (fallbackX.clamp(0.02, 0.98), ty.clamp(0.02, 0.98));
+    // 폴백: 형태가 허용하는 가장 가까운 안전 거리로 좌/우 이동
+    final gap = (rPx * 2.4 + shape.fold<double>(0, (m, s) {
+          final d = math.sqrt(
+            (s.$1 - tcx) * (s.$1 - tcx) + (s.$2 - tcy) * (s.$2 - tcy),
+          );
+          return math.max(m, d);
+        })) /
+        w;
+    final fx = (tx + gap <= 0.96) ? tx + gap : tx - gap;
+    return (fx.clamp(0.02, 0.98), ty.clamp(0.02, 0.98));
   }
 
+  // 4) 점수순 정렬 후, 서로 가까운 중복 후보를 제거해 다양한 상위 후보만 유지
   candidates.sort((a, b) => a.$1.compareTo(b.$1));
-  final topK = math.min(12, candidates.length);
-  final pick = candidates[variantIndex.abs() % topK];
-  return (pick.$2, pick.$3);
+  final picked = <(double score, double dx, double dy)>[];
+  for (final c in candidates) {
+    var near = false;
+    for (final q in picked) {
+      final ex = c.$2 - q.$2;
+      final ey = c.$3 - q.$3;
+      if (ex * ex + ey * ey < (rPx * 1.2) * (rPx * 1.2)) {
+        near = true;
+        break;
+      }
+    }
+    if (!near) picked.add(c);
+    if (picked.length >= 10) break;
+  }
+  final pick = picked[variantIndex.abs() % picked.length];
+  return (
+    (tx + pick.$2 / w).clamp(0.02, 0.98),
+    (ty + pick.$3 / h).clamp(0.02, 0.98),
+  );
 }
 
 /// 점 (px, py)에서 선분 (ax, ay)-(bx, by)까지의 최소 거리 제곱 계산
@@ -1190,37 +1326,76 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
     final y0 = math.max(0, (minY - r).floor());
     final y1 = math.min(h - 1, (maxY + r).ceil());
 
-    // 선택된 원/스트로크 내부(0 ~ 80% 반경)는 100% 완전 대체(wt = 1.0)하고,
-    // 가장자리 외곽 20% 테두리만 부드럽게 페더링하여 뭉개짐 없이 선명하게 대체
-    final innerR = r * 0.80;
+    // 중심부(0 ~ 55% 반경)는 100% 대체하고, 바깥 45% 구간은 넓고 부드러운 스무스스텝으로
+    // 페더링하여 경계선이 티 나지 않고 주변과 자연스럽게 이어지도록 함
+    final innerR = r * 0.55;
     final featherSpan = math.max(1.0, r - innerR);
     final segCount = (ptsPx.length ~/ 2) - 1;
+
+    // 스팟(원 또는 스트로크 경로)까지의 최소 거리 제곱
+    double distSqAt(double xd, double yd) {
+      if (!hasStrokePath) {
+        final dx = xd - tx;
+        final dy = yd - ty;
+        return dx * dx + dy * dy;
+      }
+      var best = double.infinity;
+      for (var s = 0; s < segCount; s++) {
+        final i0 = s * 2;
+        final d2 = _distToSegmentSq(
+          xd,
+          yd,
+          ptsPx[i0],
+          ptsPx[i0 + 1],
+          ptsPx[i0 + 2],
+          ptsPx[i0 + 3],
+        );
+        if (d2 < best) best = d2;
+      }
+      return best;
+    }
+
+    // 경계 링(1.0r ~ 1.4r)에서 타겟 주변 평균색과 소스 주변 평균색의 차이를 구해
+    // 소스 패치의 저주파 밝기/색을 주변에 맞춤 (시임리스 클론)
+    var deltaR = 0.0, deltaG = 0.0, deltaB = 0.0;
+    {
+      final ringOuterSq = (r * 1.4) * (r * 1.4);
+      final rx0 = math.max(0, (minX - r * 1.4).floor());
+      final rx1 = math.min(w - 1, (maxX + r * 1.4).ceil());
+      final ry0 = math.max(0, (minY - r * 1.4).floor());
+      final ry1 = math.min(h - 1, (maxY + r * 1.4).ceil());
+      final stride = math.max(1, (r / 10).floor());
+      var tR = 0.0, tG = 0.0, tB = 0.0, sR = 0.0, sG = 0.0, sB = 0.0;
+      var n = 0;
+      for (var y = ry0; y <= ry1; y += stride) {
+        for (var x = rx0; x <= rx1; x += stride) {
+          final d2 = distSqAt(x.toDouble(), y.toDouble());
+          if (d2 < rSq || d2 >= ringOuterSq) continue;
+          final sxp = (x + offX).clamp(0, w - 1);
+          final syp = (y + offY).clamp(0, h - 1);
+          final si = (syp * w + sxp) * 3;
+          final di = (y * w + x) * 3;
+          tR += buf[di];
+          tG += buf[di + 1];
+          tB += buf[di + 2];
+          sR += buf[si];
+          sG += buf[si + 1];
+          sB += buf[si + 2];
+          n++;
+        }
+      }
+      if (n >= 6) {
+        deltaR = ((tR - sR) / n).clamp(-0.25, 0.25);
+        deltaG = ((tG - sG) / n).clamp(-0.25, 0.25);
+        deltaB = ((tB - sB) / n).clamp(-0.25, 0.25);
+      }
+    }
 
     final snapshot = <int, (double, double, double)>{};
     for (var y = y0; y <= y1; y++) {
       final yd = y.toDouble();
       for (var x = x0; x <= x1; x++) {
-        final xd = x.toDouble();
-        double distSq;
-        if (!hasStrokePath) {
-          final dx = xd - tx;
-          final dy = yd - ty;
-          distSq = dx * dx + dy * dy;
-        } else {
-          distSq = double.infinity;
-          for (var s = 0; s < segCount; s++) {
-            final i0 = s * 2;
-            final d2 = _distToSegmentSq(
-              xd,
-              yd,
-              ptsPx[i0],
-              ptsPx[i0 + 1],
-              ptsPx[i0 + 2],
-              ptsPx[i0 + 3],
-            );
-            if (d2 < distSq) distSq = d2;
-          }
-        }
+        final distSq = distSqAt(x.toDouble(), yd);
         if (distSq >= rSq) continue;
 
         final dist = math.sqrt(distSq);
@@ -1236,10 +1411,13 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
         final syp = (y + offY).clamp(0, h - 1);
         final si = (syp * w + sxp) * 3;
         final di = (y * w + x) * 3;
+        final cr = math.max(0.0, buf[si] + deltaR);
+        final cg = math.max(0.0, buf[si + 1] + deltaG);
+        final cb = math.max(0.0, buf[si + 2] + deltaB);
         snapshot[di] = (
-          buf[di] * (1.0 - wt) + buf[si] * wt,
-          buf[di + 1] * (1.0 - wt) + buf[si + 1] * wt,
-          buf[di + 2] * (1.0 - wt) + buf[si + 2] * wt,
+          buf[di] * (1.0 - wt) + cr * wt,
+          buf[di + 1] * (1.0 - wt) + cg * wt,
+          buf[di + 2] * (1.0 - wt) + cb * wt,
         );
       }
     }

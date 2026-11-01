@@ -46,7 +46,7 @@ class PhotonRawApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PhotonRaw v1.0.9 — Pro RAW & Photo Darkroom',
+      title: 'PhotonRaw v1.0.10 — Pro RAW & Photo Darkroom',
       debugShowCheckedModeBanner: false,
       // Windows flutter_windows.dll(0x3c1ca) AccessibilityBridge AXTree 크래시 원천 차단을 위해 Semantics 트리 비활성화
       builder: (context, child) => ExcludeSemantics(
@@ -302,7 +302,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   Timer? _qualityDebounceTimer;
 
   bool _isLoadingFile = false;
-  String _statusMessage = '준비 완료 (v1.0.9) — 사진 또는 RAW 파일을 열어주세요';
+  String _statusMessage = '준비 완료 (v1.0.10) — 사진 또는 RAW 파일을 열어주세요';
 
   // 우측 모듈 필터 및 검색 상태 (SemiDarktable 6개 카테고리 탭과 동일)
   String _activeCategory = 'all'; // 'all', 'active', 'tone', 'color', 'geometry', 'detail'
@@ -328,6 +328,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
   bool _spotEditMode = false;
   double _newSpotRadius = 0.025;
   int? _selectedSpotIndex;
+  DateTime? _lastSpotUndoAt;
   int _spotVariantCounter = 0;
   bool _redEyeEditMode = false;
   double _newRedEyeRadius = 0.025;
@@ -640,6 +641,37 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       _statusMessage = '다시 실행 완료';
     });
     _triggerRender(fast: false);
+  }
+
+  /// 선택된 스팟(없으면 무시)을 삭제 — 스팟 편집 모드에서 Delete/Backspace 키로 호출
+  void _deleteSelectedSpotByKey() {
+    if (!_spotEditMode) return;
+    final photo = _currentPhoto;
+    final sel = _selectedSpotIndex;
+    if (photo == null || sel == null || sel < 0) return;
+    if (sel >= photo.params.spots.length) return;
+    _deleteSpotAt(sel);
+  }
+
+  /// 지정한 인덱스의 스팟 삭제 (실행 취소 가능)
+  void _deleteSpotAt(int index) {
+    final photo = _currentPhoto;
+    if (photo == null || index < 0 || index >= photo.params.spots.length) {
+      return;
+    }
+    _updateParams(
+      (params) {
+        params.spots.removeAt(index);
+        if (params.spots.isEmpty) {
+          params.spotEnabled = false;
+          _selectedSpotIndex = null;
+        } else {
+          _selectedSpotIndex = math.min(index, params.spots.length - 1);
+        }
+      },
+      recordUndo: true,
+      fast: false,
+    );
   }
 
   /// 파라미터 업데이트 헬퍼
@@ -1170,8 +1202,23 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       bindings: {
         const SingleActivator(LogicalKeyboardKey.keyO, control: true):
             _pickAndLoadFiles,
+        // 실행 취소 / 다시 실행 (Windows·Linux: Ctrl, macOS: Cmd)
         const SingleActivator(LogicalKeyboardKey.keyZ, control: true): _undo,
+        const SingleActivator(LogicalKeyboardKey.keyZ, meta: true): _undo,
         const SingleActivator(LogicalKeyboardKey.keyY, control: true): _redo,
+        const SingleActivator(LogicalKeyboardKey.keyY, meta: true): _redo,
+        const SingleActivator(
+          LogicalKeyboardKey.keyZ,
+          control: true,
+          shift: true,
+        ): _redo,
+        const SingleActivator(LogicalKeyboardKey.keyZ, meta: true, shift: true):
+            _redo,
+        // 스팟 편집 중 선택된 스팟 삭제
+        const SingleActivator(LogicalKeyboardKey.delete):
+            _deleteSelectedSpotByKey,
+        const SingleActivator(LogicalKeyboardKey.backspace):
+            _deleteSelectedSpotByKey,
         const SingleActivator(LogicalKeyboardKey.keyB): () {
           if (_currentPhoto != null) {
             _updateParams(
@@ -1185,6 +1232,8 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         },
       },
       child: Focus(
+        // 시작 시 자동 포커스를 받아야 Ctrl+Z / Ctrl+Y 단축키가 즉시 동작함
+        autofocus: true,
         child: DropTarget(
           onDragDone: (details) {
             final paths = details.files
@@ -1306,7 +1355,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.9',
+                '⚡ PhotonRaw v1.0.10',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -1474,7 +1523,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           onSelectedSpotChanged: (idx) {
             setState(() => _selectedSpotIndex = idx);
           },
-          onResolveSmartSpotSource: (tx, ty, r) {
+          onResolveSmartSpotSource: (tx, ty, r, path) {
             if (_currentPhoto == null) {
               final off = (r * 2.4).clamp(0.025, 0.16);
               return (
@@ -1489,6 +1538,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               ty,
               r,
               variantIndex: 0,
+              path: path,
             );
           },
           redEyeEditMode: _redEyeEditMode,
@@ -1527,7 +1577,13 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           },
           onWbSamplePicked: _handleWbSamplePicked,
           onSpotsChanged: (spots) {
-            _pushUndoSnapshot();
+            // 스팟 드래그 중 매 프레임 스냅샷이 쌓이지 않도록 400ms 이내 연속 변경은 하나로 묶음
+            final nowT = DateTime.now();
+            if (_lastSpotUndoAt == null ||
+                nowT.difference(_lastSpotUndoAt!).inMilliseconds > 400) {
+              _pushUndoSnapshot();
+            }
+            _lastSpotUndoAt = nowT;
             _updateParams(
               (p) {
                 p.spotEnabled = spots.isNotEmpty;
@@ -2103,6 +2159,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                       target.r,
                       variantIndex: _spotVariantCounter,
                       ignoreSpotIndex: idx,
+                      path: target.path,
                     );
                     _updateParams(
                       (params) {
@@ -2116,28 +2173,69 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                 ),
                 const SizedBox(width: 6),
                 Expanded(
-                  child: _smallBtn('🗑 선택/마지막 스팟 삭제', () {
+                  child: _smallBtn('🗑 선택한 스팟 삭제 (Del)', () {
                     if (p.spots.isEmpty) return;
-                    _updateParams(
-                      (params) {
-                        final removeIdx = (_selectedSpotIndex != null &&
-                                _selectedSpotIndex! >= 0 &&
-                                _selectedSpotIndex! < params.spots.length)
-                            ? _selectedSpotIndex!
-                            : params.spots.length - 1;
-                        params.spots.removeAt(removeIdx);
-                        _selectedSpotIndex = params.spots.isEmpty
-                            ? null
-                            : params.spots.length - 1;
-                        if (params.spots.isEmpty) params.spotEnabled = false;
-                      },
-                      recordUndo: true,
-                      fast: false,
-                    );
+                    final removeIdx = (_selectedSpotIndex != null &&
+                            _selectedSpotIndex! >= 0 &&
+                            _selectedSpotIndex! < p.spots.length)
+                        ? _selectedSpotIndex!
+                        : p.spots.length - 1;
+                    _deleteSpotAt(removeIdx);
                   }),
                 ),
               ],
             ),
+            if (p.spots.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text(
+                '스팟 목록 (${p.spots.length}) — 칩을 눌러 선택, ✕로 개별 삭제',
+                style: const TextStyle(fontSize: 10.5, color: Color(0xFF9E9E9E)),
+              ),
+              const SizedBox(height: 4),
+              Wrap(
+                spacing: 5,
+                runSpacing: 5,
+                children: [
+                  for (int i = 0; i < p.spots.length; i++)
+                    InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () => setState(() => _selectedSpotIndex = i),
+                      child: Container(
+                        padding: const EdgeInsets.only(left: 8, right: 2),
+                        decoration: BoxDecoration(
+                          color: i == _selectedSpotIndex
+                              ? const Color(0x33FFA000)
+                              : const Color(0xFF2C2C2C),
+                          border: Border.all(
+                            color: i == _selectedSpotIndex
+                                ? const Color(0xFFFFA000)
+                                : const Color(0xFF444444),
+                          ),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              '${p.spots[i].path.length >= 2 ? '스트로크' : '원'} ${i + 1}',
+                              style: const TextStyle(fontSize: 11),
+                            ),
+                            const SizedBox(width: 2),
+                            InkWell(
+                              borderRadius: BorderRadius.circular(10),
+                              onTap: () => _deleteSpotAt(i),
+                              child: const Padding(
+                                padding: EdgeInsets.all(4),
+                                child: Icon(Icons.close, size: 14),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ],
             const SizedBox(height: 4),
             SizedBox(
               width: double.infinity,

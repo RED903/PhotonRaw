@@ -28,8 +28,12 @@ class ViewportCanvas extends StatefulWidget {
   final double newSpotRadius;
   final int? selectedSpotIndex;
   final ValueChanged<int?>? onSelectedSpotChanged;
-  final (double, double) Function(double tx, double ty, double r)?
-      onResolveSmartSpotSource;
+  final (double, double) Function(
+    double tx,
+    double ty,
+    double r,
+    List<List<double>> path,
+  )? onResolveSmartSpotSource;
   final bool redEyeEditMode;
   final double newRedEyeRadius;
   final double newRedEyeStrength;
@@ -196,9 +200,14 @@ class ViewportCanvasState extends State<ViewportCanvas> {
     }
   }
 
-  (double, double) _resolveSmartSource(double tx, double ty, double r) {
+  (double, double) _resolveSmartSource(
+    double tx,
+    double ty,
+    double r, [
+    List<List<double>> path = const [],
+  ]) {
     if (widget.onResolveSmartSpotSource != null) {
-      return widget.onResolveSmartSpotSource!(tx, ty, r);
+      return widget.onResolveSmartSpotSource!(tx, ty, r, path);
     }
     final offsetNorm = (r * 2.4).clamp(0.025, 0.16);
     final srcX = (tx + offsetNorm <= 0.96)
@@ -695,9 +704,14 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       final cx = (sumX / strokePts.length).clamp(0.01, 0.99);
       final cy = (sumY / strokePts.length).clamp(0.01, 0.99);
       final r = widget.newSpotRadius;
-      final src = _resolveSmartSource(cx, cy, r);
       final isMultiPoint = strokePts.length >= 2 &&
           (strokePts.last - strokePts.first).distance > 0.004;
+      final strokePath = isMultiPoint
+          ? [
+              for (final pt in strokePts) [pt.dx, pt.dy],
+            ]
+          : <List<double>>[];
+      final src = _resolveSmartSource(cx, cy, r, strokePath);
 
       final spots = widget.params.spots.map((s) => s.clone()).toList()
         ..add(
@@ -707,11 +721,7 @@ class ViewportCanvasState extends State<ViewportCanvas> {
             r: r,
             srcX: src.$1,
             srcY: src.$2,
-            path: isMultiPoint
-                ? [
-                    for (final pt in strokePts) [pt.dx, pt.dy],
-                  ]
-                : [],
+            path: strokePath,
           ),
         );
       widget.onSelectedSpotChanged?.call(spots.length - 1);

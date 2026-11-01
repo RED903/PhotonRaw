@@ -12,6 +12,46 @@ import 'package:photon_raw/widgets/color_equalizer_widget.dart';
 import 'package:photon_raw/widgets/tone_curve_widget.dart';
 
 void main() {
+  test('스팟 소스 탐색: 스트로크 길이를 고려해 타겟과 겹치지 않는 위치 선택 + 경계 부드러움', () {
+    const w = 200, h = 150;
+    // 좌->우 완만한 그라디언트 배경 + 타겟 위치에 어두운 잡티
+    final rgb = Uint8List(w * h * 3);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final o = (y * w + x) * 3;
+        final v = 120 + (x * 40 ~/ w);
+        rgb[o] = v;
+        rgb[o + 1] = v;
+        rgb[o + 2] = v;
+      }
+    }
+    for (var y = 70; y < 80; y++) {
+      for (var x = 90; x < 130; x++) {
+        final o = (y * w + x) * 3;
+        rgb[o] = 20;
+        rgb[o + 1] = 20;
+        rgb[o + 2] = 20;
+      }
+    }
+    final proxy = ProxyImage(w, h, rgb);
+    final params = PipelineParams();
+    // 가로로 긴 스트로크 (정규화 좌표)
+    final path = <List<double>>[
+      for (var i = 0; i <= 10; i++) [0.45 + i * 0.02, 0.5],
+    ];
+    final r = 0.04;
+    final src = findBestSpotSource(proxy, params, 0.55, 0.5, r, path: path);
+    final dx = (src.$1 - 0.55) * w;
+    final dy = (src.$2 - 0.5) * h;
+    final shift = (dx * dx + dy * dy);
+    // 스트로크 반지름(r*200=8px)의 2배 이상으로 떨어져야 함
+    expect(shift, greaterThan(16.0 * 16.0));
+    // 선택된 소스 중심은 어두운 잡티 위가 아니어야 함
+    final sx = (src.$1 * w).round();
+    final sy = (src.$2 * h).round();
+    expect(rgb[(sy * w + sx) * 3], greaterThan(60));
+  });
+
   test('renderPreview 18개 모듈 수학 연산 및 computeAllScopes 정상 작동 검증', () {
     const w = 32;
     const h = 32;
@@ -166,7 +206,8 @@ void main() {
       strokeSpotParams,
     );
     final replacedPixelIdx = ((h ~/ 2) * w + (w ~/ 4)) * 4;
-    expect(spotOut.rgba[replacedPixelIdx], closeTo(240, 2));
+    // 경계 색상 매칭이 들어가므로 정확히 240은 아니지만, 원본(10)이 소스 패치로 확실히 대체되어야 함
+    expect(spotOut.rgba[replacedPixelIdx], greaterThan(150));
   });
 
   test('14/16-bit 센서 RAW 직접 디코딩 및 8-bit 내장 JPEG 대체 로드 차단 검증', () {
@@ -213,7 +254,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1440, 900));
     await tester.pumpWidget(const PhotonRawApp());
-    expect(find.text('⚡ PhotonRaw v1.0.9'), findsOneWidget);
+    expect(find.text('⚡ PhotonRaw v1.0.10'), findsOneWidget);
     expect(find.text('사진 또는 RAW 파일을 불러오세요'), findsOneWidget);
 
     // 0. 상단 바에서 '📋 복사', '📌 붙여넣기', '📌 전체 적용' 및 외부 프리셋 드롭다운이 제거되고 '⚙️ 프리셋 관리'와 '🌐 격자 표시'가 상단에 있는지 검증
