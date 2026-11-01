@@ -1,13 +1,37 @@
 import 'dart:typed_data';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import '../services/curve_lut.dart';
 
-/// SemiDarktable의 ToneCurveWidget 1:1 이식
+/// 점 또는 곡선 근처를 터치했을 때만 즉시 GestureArena에서 승리하여
+/// 부모 ListView의 수직 스크롤을 막고, 빈 배경 영역을 터치했을 때는
+/// 즉시 양보(rejected)하여 모바일에서도 스크롤과 곡선 조작이 완벽히 공존하도록 하는 인식기
+class _SelectiveCurvePanGestureRecognizer extends PanGestureRecognizer {
+  bool Function(Offset localPosition)? shouldClaimImmediately;
+
+  _SelectiveCurvePanGestureRecognizer({
+    this.shouldClaimImmediately,
+    super.debugOwner,
+  });
+
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    super.addAllowedPointer(event);
+    final claim = shouldClaimImmediately?.call(event.localPosition) ?? false;
+    if (claim) {
+      resolve(GestureDisposition.accepted);
+    } else {
+      resolve(GestureDisposition.rejected);
+    }
+  }
+}
+
+/// SemiDarktable의 ToneCurveWidget 1:1 이식 (모바일 터치 & 스크롤 공존 최적화)
 /// - RGB / R / G / B 4채널 탭 지원
 /// - Fritsch-Carlson 단조 3차 스플라인 실시간 곡선 렌더링
-/// - 명시적인 SizedBox(width: double.infinity, height: 190)을 사용하여
-///   어떤 창 크기에서도 곡선이 사라지거나 레이아웃 오류가 나지 않도록 보장
-/// - 점 클릭/드래그 이동, 점 더블클릭 시 삭제, 빈 공간 더블클릭 시 채널 초기화
+/// - 기존 제어점 터치 반경 대폭 확대(30px)로 기존 점이 잘 안 잡히고 새 점이 생기는 문제 해결
+/// - 제어점(30px) 또는 곡선 라인(26px) 근처 터치 시에만 스크롤을 차단하고 곡선을 조작하며,
+///   곡선에서 떨어진 빈 영역을 스와이프하면 부모 스크롤이 자연스럽게 동작
 class ToneCurveWidget extends StatefulWidget {
   final Map<String, List<List<double>>> curvePoints;
   final ValueChanged<Map<String, List<List<double>>>> onChanged;
@@ -30,8 +54,16 @@ class ToneCurveWidget extends StatefulWidget {
 
 class _ToneCurveWidgetState extends State<ToneCurveWidget>
     with AutomaticKeepAliveClientMixin {
+  static const double _pad = 12.0;
+  // 기존에 생성된 점을 쉽게 잡을 수 있도록 히트 반경을 30px(지름 60px)로 확대
+  static const double _pointHitRadius = 30.0;
+  // 곡선 라인 근처 터치 인식 반경 (26px) — 이 범위 밖의 빈 영역은 스크롤 허용
+  static const double _curveLineHitRadius = 26.0;
+
   String _activeChannel = 'rgb';
   int? _draggingIndex;
+  DateTime? _lastTapTime;
+  Offset? _lastTapPos;
 
   @override
   bool get wantKeepAlive => true;
@@ -60,16 +92,20 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     return map;
   }
 
-  int? _findNearPoint(Offset localPos, Size size, List<List<double>> pts) {
-    const pad = 10.0;
-    final w = (size.width - pad * 2).clamp(1.0, 10000.0);
-    final h = (size.height - pad * 2).clamp(1.0, 10000.0);
+  int? _findNearPoint(
+    Offset localPos,
+    Size size,
+    List<List<double>> pts, {
+    double hitRadius = _pointHitRadius,
+  }) {
+    final w = (size.width - _pad * 2).clamp(1.0, 10000.0);
+    final h = (size.height - _pad * 2).clamp(1.0, 10000.0);
 
     int? bestIdx;
-    double bestDist = 14.0;
+    double bestDist = hitRadius;
     for (int i = 0; i < pts.length; i++) {
-      final px = pad + pts[i][0] * w;
-      final py = pad + (1.0 - pts[i][1]) * h;
+      final px = _pad + pts[i][0] * w;
+      final py = _pad + (1.0 - pts[i][1]) * h;
       final d = (Offset(px, py) - localPos).distance;
       if (d < bestDist) {
         bestDist = d;
@@ -79,24 +115,86 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
     return bestIdx;
   }
 
+  /// 터치 위치에서 현재 활성 채널 스플라인 곡선까지의 최소 거리(px) 계산
+  double _distanceToCurve(
+    Offset localPos,
+    Size size,
+    List<List<double>> pts,
+  ) {
+    final w = (size.width - _pad * 2).clamp(1.0, 10000.0);
+    final h = (size.height - _pad * 2).clamp(1.0, 10000.0);
+    final lut = evaluateMonotoneCubicSpline(pts, 64);
+    double minDist = double.infinity;
+    for (int i = 0; i < 64; i++) {
+      final t = i / 63.0;
+      final cx = _pad + t * w;
+      final cy = _pad + (1.0 - lut[i].clamp(0.0, 1.0)) * h;
+      final d = (Offset(cx, cy) - localPos).distance;
+      if (d < minDist) {
+        minDist = d;
+      }
+    }
+    return minDist;
+  }
+
+  /// 제어점(30px) 또는 곡선 라인(26px) 근처인지 판별
+  bool _isInteractiveTouch(Offset localPos, Size size) {
+    final pts = _currentPoints;
+    if (_findNearPoint(localPos, size, pts) != null) {
+      return true;
+    }
+    return _distanceToCurve(localPos, size, pts) <= _curveLineHitRadius;
+  }
+
   Offset _posToNorm(Offset localPos, Size size) {
-    const pad = 10.0;
-    final w = (size.width - pad * 2).clamp(1.0, 10000.0);
-    final h = (size.height - pad * 2).clamp(1.0, 10000.0);
-    final nx = ((localPos.dx - pad) / w).clamp(0.0, 1.0);
-    final ny = (1.0 - (localPos.dy - pad) / h).clamp(0.0, 1.0);
+    final w = (size.width - _pad * 2).clamp(1.0, 10000.0);
+    final h = (size.height - _pad * 2).clamp(1.0, 10000.0);
+    final nx = ((localPos.dx - _pad) / w).clamp(0.0, 1.0);
+    final ny = (1.0 - (localPos.dy - _pad) / h).clamp(0.0, 1.0);
     return Offset(nx, ny);
   }
 
+  void _handlePointerDownForDoubleTap(PointerDownEvent event, Size size) {
+    final now = DateTime.now();
+    final pos = event.localPosition;
+    if (_lastTapTime != null &&
+        _lastTapPos != null &&
+        now.difference(_lastTapTime!) < const Duration(milliseconds: 320) &&
+        (pos - _lastTapPos!).distance < 32.0) {
+      _lastTapTime = null;
+      _lastTapPos = null;
+      _draggingIndex = null;
+      _handleDoubleTapAt(pos, size);
+      return;
+    }
+    _lastTapTime = now;
+    _lastTapPos = pos;
+  }
+
   void _handlePanStart(DragStartDetails details, Size size) {
+    final pts = _currentPoints;
+    // 1순위: 확대된 반경(30px) 내의 기존 제어점 우선 선택
+    int? hit = _findNearPoint(details.localPosition, size, pts);
+
+    // 2순위: 기존 중간 제어점과 X좌표가 매우 가까운 경우(4.5% 이내) 새 점을 만들지 않고 기존 점을 잡음
+    final norm = _posToNorm(details.localPosition, size);
+    if (hit == null) {
+      for (int i = 1; i < pts.length - 1; i++) {
+        if ((pts[i][0] - norm.dx).abs() < 0.045 &&
+            (pts[i][1] - norm.dy).abs() < 0.16) {
+          hit = i;
+          break;
+        }
+      }
+    }
+
     widget.onChangeStart?.call();
     widget.onAutoTurnOn?.call();
-    final pts = _currentPoints;
-    final hit = _findNearPoint(details.localPosition, size, pts);
+
     if (hit != null) {
-      _draggingIndex = hit;
-    } else {
-      final norm = _posToNorm(details.localPosition, size);
+      setState(() => _draggingIndex = hit);
+    } else if (_distanceToCurve(details.localPosition, size, pts) <=
+        _curveLineHitRadius) {
       pts.add([norm.dx, norm.dy]);
       pts.sort((a, b) => a[0].compareTo(b[0]));
       int newIdx = 0;
@@ -108,7 +206,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
           newIdx = i;
         }
       }
-      _draggingIndex = newIdx;
+      setState(() => _draggingIndex = newIdx);
       final updated = _cloneAll();
       updated[_activeChannel] = pts;
       widget.onChanged(updated);
@@ -142,15 +240,17 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
   }
 
   void _handlePanEnd(DragEndDetails details) {
-    _draggingIndex = null;
+    if (_draggingIndex != null) {
+      setState(() => _draggingIndex = null);
+    }
     widget.onChangeEnd?.call();
   }
 
-  void _handleDoubleTapDown(TapDownDetails details, Size size) {
+  void _handleDoubleTapAt(Offset localPosition, Size size) {
     widget.onChangeStart?.call();
     widget.onAutoTurnOn?.call();
     final pts = _currentPoints;
-    final hit = _findNearPoint(details.localPosition, size, pts);
+    final hit = _findNearPoint(localPosition, size, pts);
     final updated = _cloneAll();
     if (hit != null && hit > 0 && hit < pts.length - 1) {
       pts.removeAt(hit);
@@ -252,7 +352,10 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
                     children: [
                       Text(
                         '초기화',
-                        style: TextStyle(fontSize: 10.5, color: Color(0xFFBBBBBB)),
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          color: Color(0xFFBBBBBB),
+                        ),
                       ),
                     ],
                   ),
@@ -262,36 +365,51 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
           ],
         ),
         const SizedBox(height: 6),
-        // 커브 캔버스 영역 (명시적인 폭/높이 지정으로 항상 정상 표시 보장)
+        // 커브 캔버스 영역 (점/곡선 근처 터치 시 스크롤 차단, 빈 배경 터치 시 스크롤 허용)
         LayoutBuilder(
           builder: (context, constraints) {
-            final canvasW = constraints.maxWidth.isFinite &&
-                    constraints.maxWidth > 40
-                ? constraints.maxWidth
-                : 240.0;
-            const canvasH = 185.0;
+            final canvasW =
+                constraints.maxWidth.isFinite && constraints.maxWidth > 40
+                    ? constraints.maxWidth
+                    : 240.0;
+            const canvasH = 195.0;
             final size = Size(canvasW, canvasH);
 
-            return GestureDetector(
+            return Listener(
               behavior: HitTestBehavior.opaque,
-              onPanStart: (d) => _handlePanStart(d, size),
-              onPanUpdate: (d) => _handlePanUpdate(d, size),
-              onPanEnd: _handlePanEnd,
-              onDoubleTapDown: (d) => _handleDoubleTapDown(d, size),
-              child: Container(
-                width: canvasW,
-                height: canvasH,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF181818),
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: const Color(0xFF383838)),
-                ),
-                child: CustomPaint(
-                  size: size,
-                  painter: _ToneCurvePainter(
-                    allPoints: widget.curvePoints,
-                    activeChannel: _activeChannel,
-                    activeColor: _channelColor(_activeChannel),
+              onPointerDown: (e) => _handlePointerDownForDoubleTap(e, size),
+              child: RawGestureDetector(
+                behavior: HitTestBehavior.opaque,
+                gestures: <Type, GestureRecognizerFactory>{
+                  _SelectiveCurvePanGestureRecognizer:
+                      GestureRecognizerFactoryWithHandlers<
+                          _SelectiveCurvePanGestureRecognizer>(
+                    () => _SelectiveCurvePanGestureRecognizer(debugOwner: this),
+                    (_SelectiveCurvePanGestureRecognizer instance) {
+                      instance.shouldClaimImmediately =
+                          (pos) => _isInteractiveTouch(pos, size);
+                      instance.onStart = (d) => _handlePanStart(d, size);
+                      instance.onUpdate = (d) => _handlePanUpdate(d, size);
+                      instance.onEnd = _handlePanEnd;
+                    },
+                  ),
+                },
+                child: Container(
+                  width: canvasW,
+                  height: canvasH,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF181818),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFF383838)),
+                  ),
+                  child: CustomPaint(
+                    size: size,
+                    painter: _ToneCurvePainter(
+                      allPoints: widget.curvePoints,
+                      activeChannel: _activeChannel,
+                      activeColor: _channelColor(_activeChannel),
+                      draggingIndex: _draggingIndex,
+                    ),
                   ),
                 ),
               ),
@@ -300,7 +418,7 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
         ),
         const SizedBox(height: 4),
         const Text(
-          '클릭/드래그: 포인트 추가·이동 | 포인트 더블클릭: 삭제 | 빈 공간 더블클릭: 초기화',
+          '곡선/포인트 드래그: 추가·이동 (빈 영역 스와이프: 스크롤) | 포인트 더블탭: 삭제',
           style: TextStyle(fontSize: 9.5, color: Color(0xFF777777)),
           textAlign: TextAlign.center,
         ),
@@ -310,22 +428,25 @@ class _ToneCurveWidgetState extends State<ToneCurveWidget>
 }
 
 class _ToneCurvePainter extends CustomPainter {
+  static const double _pad = 12.0;
+
   final Map<String, List<List<double>>> allPoints;
   final String activeChannel;
   final Color activeColor;
+  final int? draggingIndex;
 
   _ToneCurvePainter({
     required this.allPoints,
     required this.activeChannel,
     required this.activeColor,
+    this.draggingIndex,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    const pad = 10.0;
-    final w = (size.width - pad * 2).clamp(1.0, 10000.0);
-    final h = (size.height - pad * 2).clamp(1.0, 10000.0);
-    final rect = Rect.fromLTWH(pad, pad, w, h);
+    final w = (size.width - _pad * 2).clamp(1.0, 10000.0);
+    final h = (size.height - _pad * 2).clamp(1.0, 10000.0);
+    final rect = Rect.fromLTWH(_pad, _pad, w, h);
 
     // 4x4 격자선
     final gridPaint = Paint()
@@ -333,10 +454,10 @@ class _ToneCurvePainter extends CustomPainter {
       ..strokeWidth = 1.0;
 
     for (int i = 0; i <= 4; i++) {
-      final gx = pad + w * (i / 4.0);
-      final gy = pad + h * (i / 4.0);
-      canvas.drawLine(Offset(gx, pad), Offset(gx, pad + h), gridPaint);
-      canvas.drawLine(Offset(pad, gy), Offset(pad + w, gy), gridPaint);
+      final gx = _pad + w * (i / 4.0);
+      final gy = _pad + h * (i / 4.0);
+      canvas.drawLine(Offset(gx, _pad), Offset(gx, _pad + h), gridPaint);
+      canvas.drawLine(Offset(_pad, gy), Offset(_pad + w, gy), gridPaint);
     }
 
     // 대각선 기준선
@@ -344,8 +465,8 @@ class _ToneCurvePainter extends CustomPainter {
       ..color = const Color(0xFF3A3A3A)
       ..strokeWidth = 1.0;
     canvas.drawLine(
-      Offset(pad, pad + h),
-      Offset(pad + w, pad),
+      Offset(_pad, _pad + h),
+      Offset(_pad + w, _pad),
       diagPaint,
     );
 
@@ -369,22 +490,36 @@ class _ToneCurvePainter extends CustomPainter {
           [0.0, 0.0],
           [1.0, 1.0],
         ];
-    _drawSpline(canvas, rect, activePts, activeColor, 2.2);
+    _drawSpline(canvas, rect, activePts, activeColor, 2.4);
 
-    // 활성 채널의 제어점 그리기
+    // 활성 채널의 제어점 그리기 (모바일 터치 가시성을 높이기 위해 은은한 외곽 터치 링과 선명한 노드 표시)
+    final ptHalo = Paint()
+      ..color = activeColor.withValues(alpha: 0.20)
+      ..style = PaintingStyle.fill;
+    final ptActiveHalo = Paint()
+      ..color = activeColor.withValues(alpha: 0.38)
+      ..style = PaintingStyle.fill;
     final ptFill = Paint()
       ..color = activeColor
       ..style = PaintingStyle.fill;
     final ptBorder = Paint()
       ..color = const Color(0xFF121212)
-      ..strokeWidth = 1.5
+      ..strokeWidth = 1.8
       ..style = PaintingStyle.stroke;
 
-    for (final p in activePts) {
-      final px = pad + p[0].clamp(0.0, 1.0) * w;
-      final py = pad + (1.0 - p[1].clamp(0.0, 1.0)) * h;
-      canvas.drawCircle(Offset(px, py), 4.5, ptFill);
-      canvas.drawCircle(Offset(px, py), 4.5, ptBorder);
+    for (int i = 0; i < activePts.length; i++) {
+      final p = activePts[i];
+      final px = _pad + p[0].clamp(0.0, 1.0) * w;
+      final py = _pad + (1.0 - p[1].clamp(0.0, 1.0)) * h;
+      final center = Offset(px, py);
+      final isDragging = draggingIndex == i;
+      canvas.drawCircle(
+        center,
+        isDragging ? 14.0 : 10.0,
+        isDragging ? ptActiveHalo : ptHalo,
+      );
+      canvas.drawCircle(center, isDragging ? 6.5 : 5.5, ptFill);
+      canvas.drawCircle(center, isDragging ? 6.5 : 5.5, ptBorder);
     }
   }
 

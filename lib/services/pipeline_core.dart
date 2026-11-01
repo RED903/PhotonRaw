@@ -465,6 +465,10 @@ FloatImage applyPipeline(FloatImage geo, PipelineParams p) {
 
   _colorStage(buf, w, h, p);
 
+  if (p.redEyeEnabled && p.redEyes.isNotEmpty) {
+    _applyRedEyes(buf, w, h, p.redEyes);
+  }
+
   final detailed = _detailsStage(buf, w, h, p);
   return FloatImage(w, h, detailed);
 }
@@ -805,7 +809,8 @@ double _rand(double x, double y) {
 
 Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
   final shOn = p.sharpenEnabled && p.shAmount > 0;
-  final lcOn = p.localContrastEnabled && (p.lcDetail > 0 || p.lcClarity != 0);
+  final lcOn = p.localContrastEnabled &&
+      (p.lcDetail.abs() > 0.001 || p.lcClarity.abs() > 0.001);
   final dnOn = p.denoiseEnabled && p.dnStrength > 0;
   final blOn = p.blurEnabled && p.blurRadius > 0;
   final grOn = p.grainEnabled && p.grAmount > 0;
@@ -834,13 +839,40 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
   }
 
   if (lcOn) {
-    final blur = boxBlur(img, w, h, 3);
+    // Texture(lcDetail): 세밀한 반경(r=2) 로컬 디테일 강화/완화 (-1..+1)
+    // Clarity(lcClarity): 넓은 반경 미드톤 로컬 콘트라스트 (-1..+1, 전체 밝기 왜곡 및 암부/명부 클리핑 방지)
+    final hasTex = p.lcDetail.abs() > 0.001;
+    final hasClar = p.lcClarity.abs() > 0.001;
+    final blurFine = hasTex ? boxBlur(img, w, h, 2) : null;
+    final clarityRadius = math.max(5, (math.min(w, h) / 65).round());
+    final blurWide = hasClar
+        ? boxBlur(boxBlur(img, w, h, clarityRadius), w, h, (clarityRadius + 1) ~/ 2)
+        : null;
+
     final o = Float32List(n);
-    for (var i = 0; i < n; i++) {
-      var v = img[i].toDouble();
-      if (p.lcDetail > 0) v += (v - blur[i]) * p.lcDetail * 1.5;
-      if (p.lcClarity != 0) v = (v - 0.5) * (1.0 + p.lcClarity * 0.5) + 0.5;
-      o[i] = v;
+    final pixCount = w * h;
+    for (var pIdx = 0; pIdx < pixCount; pIdx++) {
+      final i = pIdx * 3;
+      final r = img[i].toDouble();
+      final g = img[i + 1].toDouble();
+      final b = img[i + 2].toDouble();
+
+      // 지각 휘도 기반 미드톤 보호 가중치 (암부/하이라이트 과포화 방지)
+      final lumLin = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+      final lumSrgb = math.sqrt(lumLin);
+      final midWeight = (4.0 * lumSrgb * (1.0 - lumSrgb)).clamp(0.18, 1.0);
+      final texWeight = 0.45 + 0.55 * midWeight;
+
+      for (var c = 0; c < 3; c++) {
+        var v = img[i + c].toDouble();
+        if (blurFine != null) {
+          v += (v - blurFine[i + c]) * p.lcDetail * 0.85 * texWeight;
+        }
+        if (blurWide != null) {
+          v += (v - blurWide[i + c]) * p.lcClarity * 0.65 * midWeight;
+        }
+        o[i + c] = v;
+      }
     }
     img = clampedCopy(o);
   }
@@ -912,7 +944,133 @@ Float32List _detailsStage(Float32List input, int w, int h, PipelineParams p) {
   return img;
 }
 
-// ───────────────────────── 스팟 리터칭 ─────────────────────────
+// ───────────────────────── 스팟 리터칭 & 적목 제거 ─────────────────────────
+
+/// 타겟 위치 (tx, ty) 주변에서 경계 색상/휘도 연속성과 패치 내부 균일도가 가장 뛰어난 최적의 소스 좌표를 탐색합니다.
+/// [variantIndex]를 증가시키면 차선책 후보들을 순환하며 선택할 수 있습니다.
+(double, double) findBestSpotSource(
+  ProxyImage src,
+  PipelineParams p,
+  double tx,
+  double ty,
+  double r, {
+  int variantIndex = 0,
+  int? ignoreSpotIndex,
+}) {
+  final lin = srgb8ToLinear(src);
+  final geo = applyGeometry(lin, p);
+  final w = geo.width;
+  final h = geo.height;
+  final buf = geo.data;
+  final maxDim = math.max(w, h).toDouble();
+  final rPx = math.max(3.0, r * maxDim);
+
+  // 타겟 외곽 링(1.05r ~ 1.35r)의 평균 색상 샘플링 (잡티 중심부 오염 배제)
+  var tR = 0.0, tG = 0.0, tB = 0.0;
+  var tCount = 0;
+  const ringSamples = 16;
+  for (var i = 0; i < ringSamples; i++) {
+    final ang = (2.0 * math.pi * i) / ringSamples;
+    final sx = (tx * w + math.cos(ang) * rPx * 1.15).round().clamp(0, w - 1);
+    final sy = (ty * h + math.sin(ang) * rPx * 1.15).round().clamp(0, h - 1);
+    final o = (sy * w + sx) * 3;
+    tR += buf[o];
+    tG += buf[o + 1];
+    tB += buf[o + 2];
+    tCount++;
+  }
+  if (tCount > 0) {
+    tR /= tCount;
+    tG /= tCount;
+    tB /= tCount;
+  }
+
+  final margin = (r * 1.3).clamp(0.02, 0.25);
+  final candidates = <(double score, double cx, double cy)>[];
+  final distMultipliers = [2.2, 3.2, 4.5, 6.0];
+  const dirs = 16;
+
+  for (final dm in distMultipliers) {
+    final distNorm = (r * dm).clamp(0.025, 0.35);
+    for (var d = 0; d < dirs; d++) {
+      final ang = (2.0 * math.pi * d) / dirs;
+      final aspect = w / math.max(1.0, h.toDouble());
+      final cx = tx + math.cos(ang) * distNorm / math.max(1.0, aspect);
+      final cy = ty + math.sin(ang) * distNorm * math.min(1.0, aspect);
+
+      if (cx < margin || cx > 1.0 - margin || cy < margin || cy > 1.0 - margin) {
+        continue;
+      }
+
+      // 기존 스팟 타겟 영역과 겹치는 후보는 회피
+      var overlaps = false;
+      for (var si = 0; si < p.spots.length; si++) {
+        if (si == ignoreSpotIndex) continue;
+        final ex = p.spots[si];
+        final dx = cx - ex.x;
+        final dy = cy - ex.y;
+        if (math.sqrt(dx * dx + dy * dy) < (r + ex.r) * 1.3) {
+          overlaps = true;
+          break;
+        }
+      }
+      if (overlaps) continue;
+
+      // 후보 패치의 평균 색상 및 내부 분산(평탄도) 계산
+      var cR = 0.0, cG = 0.0, cB = 0.0;
+      var cR2 = 0.0, cG2 = 0.0, cB2 = 0.0;
+      var cnt = 0;
+      for (var ring = 0; ring <= 2; ring++) {
+        final rad = rPx * (ring * 0.45);
+        final steps = ring == 0 ? 1 : 8;
+        for (var k = 0; k < steps; k++) {
+          final a = (2.0 * math.pi * k) / steps;
+          final px = (cx * w + math.cos(a) * rad).round().clamp(0, w - 1);
+          final py = (cy * h + math.sin(a) * rad).round().clamp(0, h - 1);
+          final o = (py * w + px) * 3;
+          final vr = buf[o].toDouble();
+          final vg = buf[o + 1].toDouble();
+          final vb = buf[o + 2].toDouble();
+          cR += vr;
+          cG += vg;
+          cB += vb;
+          cR2 += vr * vr;
+          cG2 += vg * vg;
+          cB2 += vb * vb;
+          cnt++;
+        }
+      }
+      if (cnt == 0) continue;
+      cR /= cnt;
+      cG /= cnt;
+      cB /= cnt;
+      final varR = math.max(0.0, cR2 / cnt - cR * cR);
+      final varG = math.max(0.0, cG2 / cnt - cG * cG);
+      final varB = math.max(0.0, cB2 / cnt - cB * cB);
+      final internalVariance = varR + varG + varB;
+
+      // 타겟 주변부와의 색/휘도 차이
+      final dr = cR - tR;
+      final dg = cG - tG;
+      final db = cB - tB;
+      final colorDiff = dr * dr * 1.2 + dg * dg * 1.6 + db * db * 1.0;
+
+      // 가까울수록 약간의 가산점, 평탄하고 색이 비슷할수록 낮은 점수(우수)
+      final score = colorDiff * 3.0 + internalVariance * 1.8 + dm * 0.0015;
+      candidates.add((score, cx.clamp(0.02, 0.98), cy.clamp(0.02, 0.98)));
+    }
+  }
+
+  if (candidates.isEmpty) {
+    final fallbackX = (tx + r * 2.4 <= 0.96) ? tx + r * 2.4 : tx - r * 2.4;
+    return (fallbackX.clamp(0.02, 0.98), ty.clamp(0.02, 0.98));
+  }
+
+  candidates.sort((a, b) => a.$1.compareTo(b.$1));
+  final topK = math.min(12, candidates.length);
+  final pick = candidates[variantIndex.abs() % topK];
+  return (pick.$2, pick.$3);
+}
 
 void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
   for (final sp in spots) {
@@ -929,6 +1087,32 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
     final y0 = math.max(0, (ty - r).floor());
     final y1 = math.min(h - 1, (ty + r).ceil());
 
+    // 힐링 블렌딩(Healing Blend): 타겟 외곽 링과 소스 외곽 링의 저주파 밝기/색상 차이를 계산하여 경계 이질감 제거
+    var diffR = 0.0, diffG = 0.0, diffB = 0.0;
+    var ringCount = 0;
+    for (var y = y0; y <= y1; y++) {
+      for (var x = x0; x <= x1; x++) {
+        final dx = x - tx;
+        final dy = y - ty;
+        final dist = math.sqrt(dx * dx + dy * dy);
+        if (dist >= r * 0.72 && dist <= r) {
+          final sxp = (x + offX).clamp(0, w - 1);
+          final syp = (y + offY).clamp(0, h - 1);
+          final si = (syp * w + sxp) * 3;
+          final di = (y * w + x) * 3;
+          diffR += buf[di] - buf[si];
+          diffG += buf[di + 1] - buf[si + 1];
+          diffB += buf[di + 2] - buf[si + 2];
+          ringCount++;
+        }
+      }
+    }
+    if (ringCount > 0) {
+      diffR = (diffR / ringCount) * 0.65;
+      diffG = (diffG / ringCount) * 0.65;
+      diffB = (diffB / ringCount) * 0.65;
+    }
+
     // 겹치는 복제로 인한 오염을 막기 위해 원본 스냅샷 사용
     final snapshot = <int, List<double>>{};
     for (var y = y0; y <= y1; y++) {
@@ -937,16 +1121,20 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
         final dy = y - ty;
         final dist = math.sqrt(dx * dx + dy * dy);
         if (dist >= r) continue;
-        var wt = ((r - dist) / math.max(1.0, r * 0.35)).clamp(0.0, 1.0).toDouble();
-        wt = wt * wt * (3.0 - 2.0 * wt);
+        // 부드러운 코사인 페더링
+        final normDist = (dist / r).clamp(0.0, 1.0);
+        final wt = 0.5 * (1.0 + math.cos(math.pi * normDist));
         final sxp = (x + offX).clamp(0, w - 1);
         final syp = (y + offY).clamp(0, h - 1);
         final si = (syp * w + sxp) * 3;
         final di = (y * w + x) * 3;
+        final healedR = (buf[si] + diffR).clamp(0.0, 1.0).toDouble();
+        final healedG = (buf[si + 1] + diffG).clamp(0.0, 1.0).toDouble();
+        final healedB = (buf[si + 2] + diffB).clamp(0.0, 1.0).toDouble();
         snapshot[di] = [
-          buf[di] * (1 - wt) + buf[si] * wt,
-          buf[di + 1] * (1 - wt) + buf[si + 1] * wt,
-          buf[di + 2] * (1 - wt) + buf[si + 2] * wt,
+          buf[di] * (1.0 - wt) + healedR * wt,
+          buf[di + 1] * (1.0 - wt) + healedG * wt,
+          buf[di + 2] * (1.0 - wt) + healedB * wt,
         ];
       }
     }
@@ -955,6 +1143,59 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
       buf[di + 1] = v[1];
       buf[di + 2] = v[2];
     });
+  }
+}
+
+/// 적목 제거(Red-Eye Correction): 지정된 원형 영역 내의 비정상적인 적색 반사광(R >> G, B)만
+/// 감지하여 흰색 안구 반사광(Catchlight)과 주변 피부톤은 보존하면서 자연스러운 어두운 동공으로 복원합니다.
+void _applyRedEyes(Float32List buf, int w, int h, List<RedEyeSpot> redEyes) {
+  final maxDim = math.max(w, h).toDouble();
+  for (final re in redEyes) {
+    final cx = re.x * w;
+    final cy = re.y * h;
+    final r = math.max(2.0, re.r * maxDim);
+    final str = re.strength.clamp(0.0, 1.0);
+    if (str <= 0.001) continue;
+
+    final x0 = math.max(0, (cx - r).floor());
+    final x1 = math.min(w - 1, (cx + r).ceil());
+    final y0 = math.max(0, (cy - r).floor());
+    final y1 = math.min(h - 1, (cy + r).ceil());
+
+    for (var y = y0; y <= y1; y++) {
+      for (var x = x0; x <= x1; x++) {
+        final dx = x - cx;
+        final dy = y - cy;
+        final dist = math.sqrt(dx * dx + dy * dy);
+        if (dist >= r) continue;
+
+        final o = (y * w + x) * 3;
+        final rv = buf[o].toDouble();
+        final gv = buf[o + 1].toDouble();
+        final bv = buf[o + 2].toDouble();
+
+        final avgGB = 0.5 * (gv + bv);
+        final maxGB = math.max(gv, bv);
+        final minGB = math.min(gv, bv);
+
+        // 적목 픽셀 판별: R 채널이 G, B 대비 뚜렷하게 높은 픽셀만 타겟팅
+        final redRatio = rv / math.max(0.004, avgGB);
+        if (redRatio <= 1.18 || (rv - maxGB) <= 0.012) continue;
+
+        // 공간적 페더링 * 적색 과잉도 * 하이라이트 캐치라이트 보존
+        final spatialW = 0.5 * (1.0 + math.cos(math.pi * (dist / r)));
+        final redExcessW = ((redRatio - 1.18) / 0.75).clamp(0.0, 1.0);
+        final catchlightProtect = (1.0 - ((minGB - 0.55) / 0.35).clamp(0.0, 1.0));
+        final wgt = (spatialW * redExcessW * catchlightProtect * math.min(1.0, str * 1.1))
+            .clamp(0.0, 1.0);
+
+        // 자연스러운 어두운 동공 휘도로 수렴
+        final pupilLum = (avgGB * 0.32).clamp(0.0, 1.0);
+        buf[o] = (rv + (pupilLum - rv) * wgt).clamp(0.0, 1.0).toDouble();
+        buf[o + 1] = (gv + (pupilLum - gv) * (wgt * 0.55)).clamp(0.0, 1.0).toDouble();
+        buf[o + 2] = (bv + (pupilLum - bv) * (wgt * 0.55)).clamp(0.0, 1.0).toDouble();
+      }
+    }
   }
 }
 

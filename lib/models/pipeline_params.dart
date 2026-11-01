@@ -39,6 +39,37 @@ class Spot {
   }
 }
 
+/// 적목 제거(Red-Eye) 한 점 (0~1 정규화 좌표)
+class RedEyeSpot {
+  double x;
+  double y;
+  double r;
+  double strength;
+
+  RedEyeSpot({
+    required this.x,
+    required this.y,
+    this.r = 0.025,
+    this.strength = 0.85,
+  });
+
+  RedEyeSpot clone() => RedEyeSpot(x: x, y: y, r: r, strength: strength);
+
+  Map<String, dynamic> toMap() => {
+        'x': x,
+        'y': y,
+        'r': r,
+        'strength': strength,
+      };
+
+  factory RedEyeSpot.fromMap(Map m) => RedEyeSpot(
+        x: _d(m['x'], 0.5),
+        y: _d(m['y'], 0.5),
+        r: _d(m['r'], 0.025),
+        strength: _d(m['strength'], 0.85),
+      );
+}
+
 double _d(dynamic v, double def) => v is num ? v.toDouble() : def;
 bool _b(dynamic v, bool def) => v is bool ? v : def;
 
@@ -157,6 +188,9 @@ class PipelineParams {
   bool spotEnabled = false;
   List<Spot> spots = [];
 
+  bool redEyeEnabled = false;
+  List<RedEyeSpot> redEyes = [];
+
   // 뷰
   bool splitViewEnabled = false;
   double splitPosition = 0.5;
@@ -234,6 +268,8 @@ class PipelineParams {
         'df_threshold': dfThreshold,
         'spot_enabled': spotEnabled,
         'spots': [for (final s in spots) s.toMap()],
+        'red_eye_enabled': redEyeEnabled,
+        'red_eyes': [for (final re in redEyes) re.toMap()],
         'split_view_enabled': splitViewEnabled,
         'split_position': splitPosition,
       };
@@ -340,6 +376,15 @@ class PipelineParams {
       spots = [
         for (final s in m['spots'] as List)
           if (s is Map) Spot.fromMap(s)
+      ];
+    }
+    if (m.containsKey('red_eye_enabled')) {
+      redEyeEnabled = _b(m['red_eye_enabled'], redEyeEnabled);
+    }
+    if (m['red_eyes'] is List) {
+      redEyes = [
+        for (final re in m['red_eyes'] as List)
+          if (re is Map) RedEyeSpot.fromMap(re)
       ];
     }
     if (m.containsKey('split_view_enabled')) splitViewEnabled = _b(m['split_view_enabled'], splitViewEnabled);

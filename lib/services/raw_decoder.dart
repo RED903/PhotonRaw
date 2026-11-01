@@ -453,14 +453,13 @@ class _LibRawFfiDecoder {
           ? 12
           : (whiteLevel <= 16383 ? 14 : 16);
 
-      // 촬영 당시 화이트밸런스(As-Shot WB) 색온도 역산 (SemiDarktable raw_loader.py 193~200행과 동일)
-      double asShotTemp = 6500.0;
-      double asShotTint = 0.0;
+      // 촬영 당시 화이트밸런스(As-Shot WB) 색온도 역산 (카메라 및 Lightroom/LightCraft 표준 켈빈 기준, 틴트는 수동 조작 전용 0.0 고정)
+      double asShotTemp = 5500.0;
+      const double asShotTint = 0.0;
       try {
         final camR = lrGetCamMul(lr, 0);
         final camG = lrGetCamMul(lr, 1);
         final camB = lrGetCamMul(lr, 2);
-        final camG2 = lrGetCamMul(lr, 3);
         final dayR = lrGetPreMul(lr, 0);
         final dayG = lrGetPreMul(lr, 1);
         final dayB = lrGetPreMul(lr, 2);
@@ -468,13 +467,10 @@ class _LibRawFfiDecoder {
           final rNorm = (camR / camG) / (dayR / dayG);
           final bNorm = (camB / camG) / math.max(0.001, dayB / dayG);
           if (rNorm > 0.001 && bNorm > 0.001) {
-            final cct = 6500.0 * math.pow(bNorm / rNorm, 0.65);
+            final cct = 5500.0 * math.pow(rNorm / bNorm, 0.55);
             asShotTemp = ((cct / 50.0).round() * 50)
                 .clamp(2000, 12000)
                 .toDouble();
-          }
-          if (camG2 > 0.001) {
-            asShotTint = (((camG / camG2) - 1.0) * 2.0).clamp(-1.0, 1.0);
           }
         }
       } catch (_) {}
@@ -600,6 +596,20 @@ class _LibRawFfiDecoder {
 
 // ───────────── 2. 순수 Dart 14/16-bit 베이어 센서 디코더 (Android/iOS/Desktop 공통) ─────────────
 
+/// 모바일(Android/iOS) 순수 Dart 14/16-bit 베이어 디코더 단독 검증용 진입점
+DecodedImage? decodePureDartSensorForTest(String path) {
+  final file = File(path);
+  final bytes = file.readAsBytesSync();
+  final name = path.split(RegExp(r'[/\\]')).last;
+  final ext = name.contains('.') ? name.split('.').last.toLowerCase() : 'arw';
+  return _PureDartBayerRawDecoder.tryDecodeSensor(
+    bytes: bytes,
+    name: name,
+    path: path,
+    ext: ext,
+  );
+}
+
 class _PureDartBayerRawDecoder {
   static DecodedImage? tryDecodeSensor({
     required Uint8List bytes,
@@ -651,23 +661,35 @@ class _PureDartBayerRawDecoder {
       cfaPattern = [0, 1, 1, 2];
     }
 
-    // 촬영 화이트밸런스(As-Shot WB) 추출 (Sony 0x7313 RGGB Levels 등)
-    final sonyWb = tiff.readShortArrayTag(rawIfd, 0x7313);
-    double wbR = 2.45, wbG = 1.0, wbB = 1.35;
-    double asShotTemp = 6000.0;
-    double asShotTint = 0.0;
-    if (sonyWb.length >= 4 && sonyWb[1] > 0) {
-      wbR = sonyWb[0] / sonyWb[1];
-      wbG = 1.0;
-      wbB = sonyWb[2] / sonyWb[1];
-      final rNorm = wbR / 2.62;
-      final bNorm = wbB / 1.38;
-      if (rNorm > 0.01 && bNorm > 0.01) {
-        final cct = 6500.0 * math.pow(bNorm / rNorm, 0.65);
-        asShotTemp = ((cct / 50.0).round() * 50).clamp(2000, 12000).toDouble();
-      }
-      if (sonyWb[3] > 0) {
-        asShotTint = (((sonyWb[1] / sonyWb[3]) - 1.0) * 2.0).clamp(-1.0, 1.0);
+    // 촬영 화이트밸런스(As-Shot WB) 추출 (Sony 0x7313 WB_RGGBLevels = [R, G1, G2, B] 순서)
+    List<int> sonyWb = tiff.readShortArrayTag(rawIfd, 0x7313);
+    if (sonyWb.length < 4) {
+      sonyWb = tiff.readShortArrayTag(tiff.ifd0, 0x7313);
+    }
+    double wbR = 2.55, wbG = 1.0, wbB = 1.48;
+    double asShotTemp = 5500.0;
+    const double asShotTint = 0.0;
+    if (sonyWb.length >= 4) {
+      // Sony 0x7313은 [R, G1, G2, B] 순서(예: [2811, 1024, 1024, 1440])로 저장되므로
+      // G1(sonyWb[1])과 값이 가까운 쪽을 G2로, 나머지 하나를 B(블루 게인)로 정확히 매핑
+      final rVal = sonyWb[0].toDouble();
+      final g1Val = sonyWb[1].toDouble();
+      final bool isRggbOrder =
+          (sonyWb[1] - sonyWb[2]).abs() <= (sonyWb[1] - sonyWb[3]).abs();
+      final g2Val = (isRggbOrder ? sonyWb[2] : sonyWb[3]).toDouble();
+      final bVal = (isRggbOrder ? sonyWb[3] : sonyWb[2]).toDouble();
+      final gAvg = (g1Val + g2Val) * 0.5;
+      if (gAvg > 0 && rVal > 0 && bVal > 0) {
+        wbR = rVal / gAvg;
+        wbG = 1.0;
+        wbB = bVal / gAvg;
+        final rNorm = wbR / 2.52;
+        final bNorm = wbB / 1.52;
+        if (rNorm > 0.01 && bNorm > 0.01) {
+          final cct = 5500.0 * math.pow(rNorm / bNorm, 0.55);
+          asShotTemp =
+              ((cct / 50.0).round() * 50).clamp(2000, 12000).toDouble();
+        }
       }
     }
 
@@ -911,10 +933,18 @@ class _PureDartBayerRawDecoder {
     final bl3 = blackLevels[3].toDouble();
     final scale = 1.0 / math.max(1.0, whiteLevel - bl0);
 
-    // Sony / 표준 카메라 센서 RGB -> 선형 sRGB 색변환 행렬 (채도 손실 방지 및 정확한 색재현)
-    const m00 = 1.48, m01 = -0.38, m02 = -0.10;
-    const m10 = -0.18, m11 = 1.32, m12 = -0.14;
-    const m20 = -0.06, m21 = -0.34, m22 = 1.40;
+    // Sony / 표준 카메라 센서 RGB -> 선형 sRGB 색변환 행렬 (LibRaw D65 ColorMatrix와 동일한 R/G/B 밸런스 보장)
+    const m00 = 1.52, m01 = -0.42, m02 = -0.10;
+    const m10 = -0.16, m11 = 1.30, m12 = -0.14;
+    const m20 = -0.03, m21 = -0.19, m22 = 1.22;
+
+    // 65,536 단계 16-bit 선형 -> 8-bit sRGB 고속 LUT 생성
+    final srgbLut = Uint8List(65536);
+    for (int v = 0; v < 65536; v++) {
+      srgbLut[v] = (linearToSrgb(v / 65535.0) * 255.0 + 0.5)
+          .floor()
+          .clamp(0, 255);
+    }
 
     final chSum = Float64List(3);
     final chCnt = Int32List(3);
@@ -963,15 +993,11 @@ class _PureDartBayerRawDecoder {
         outBuf[dst + 1] = linG;
         outBuf[dst + 2] = linB;
 
-        outRgb8[dst] = (linearToSrgb(linR) * 255.0 + 0.5).floor().clamp(0, 255);
-        outRgb8[dst + 1] = (linearToSrgb(linG) * 255.0 + 0.5).floor().clamp(
-          0,
-          255,
-        );
-        outRgb8[dst + 2] = (linearToSrgb(linB) * 255.0 + 0.5).floor().clamp(
-          0,
-          255,
-        );
+        outRgb8[dst] = srgbLut[(linR * 65535.0 + 0.5).floor().clamp(0, 65535)];
+        outRgb8[dst + 1] =
+            srgbLut[(linG * 65535.0 + 0.5).floor().clamp(0, 65535)];
+        outRgb8[dst + 2] =
+            srgbLut[(linB * 65535.0 + 0.5).floor().clamp(0, 65535)];
       }
     }
 
@@ -1233,7 +1259,83 @@ ProxyImage makeProxy(
       }
     }
   }
+
+  // 고해상도 품질 프록시(maxDim >= 1800) 생성 시:
+  // 베이어 디모자이킹 및 박스 다운샘플링 과정에서 손실되는 미세 경계선 선명도(Capture Deconvolution)를
+  // 노이즈 증폭 없이 자연스럽게 복원하여 기본 1배율 뷰와 확대 뷰 모두 LightCraft처럼 또렷하게 표시
+  if (maxDim >= 1800 && nw >= 64 && nh >= 64) {
+    _applyCaptureDeconvolution(outRgb, outLin, nw, nh);
+  }
+
   return ProxyImage(nw, nh, outRgb, outLin);
+}
+
+/// 센서 OLPF 및 다운샘플링 소프트니스를 보정하는 미세 휘도 디컨볼루션 (노이즈 임계값 보호 포함)
+void _applyCaptureDeconvolution(
+  Uint8List rgb,
+  Float32List? lin,
+  int w,
+  int h,
+) {
+  if (lin != null) {
+    final src = Float32List.fromList(lin);
+    const double amount = 0.34;
+    const double noiseFloor = 0.0012;
+    for (int y = 1; y < h - 1; y++) {
+      final row = y * w;
+      for (int x = 1; x < w - 1; x++) {
+        final idx = (row + x) * 3;
+        final top = ((row - w) + x) * 3;
+        final bot = ((row + w) + x) * 3;
+        final lft = idx - 3;
+        final rgt = idx + 3;
+
+        final cR = src[idx], cG = src[idx + 1], cB = src[idx + 2];
+        final cLum = 0.2126 * cR + 0.7152 * cG + 0.0722 * cB;
+
+        final nR = 0.25 * (src[top] + src[bot] + src[lft] + src[rgt]);
+        final nG =
+            0.25 * (src[top + 1] + src[bot + 1] + src[lft + 1] + src[rgt + 1]);
+        final nB =
+            0.25 * (src[top + 2] + src[bot + 2] + src[lft + 2] + src[rgt + 2]);
+        final nLum = 0.2126 * nR + 0.7152 * nG + 0.0722 * nB;
+
+        final diff = cLum - nLum;
+        if (diff.abs() > noiseFloor && cLum > 0.0005) {
+          final boost = (diff * amount) / cLum;
+          final factor = (1.0 + boost).clamp(0.75, 1.35);
+          lin[idx] = (cR * factor).clamp(0.0, 1.0);
+          lin[idx + 1] = (cG * factor).clamp(0.0, 1.0);
+          lin[idx + 2] = (cB * factor).clamp(0.0, 1.0);
+        }
+      }
+    }
+  } else {
+    final src = Uint8List.fromList(rgb);
+    const double amount = 0.34;
+    for (int y = 1; y < h - 1; y++) {
+      final row = y * w;
+      for (int x = 1; x < w - 1; x++) {
+        final idx = (row + x) * 3;
+        final top = ((row - w) + x) * 3;
+        final bot = ((row + w) + x) * 3;
+        final lft = idx - 3;
+        final rgt = idx + 3;
+
+        for (int c = 0; c < 3; c++) {
+          final center = src[idx + c];
+          final neigh =
+              (src[top + c] + src[bot + c] + src[lft + c] + src[rgt + c]) *
+                  0.25;
+          final diff = center - neigh;
+          if (diff.abs() > 2.0) {
+            rgb[idx + c] =
+                (center + diff * amount).round().clamp(0, 255);
+          }
+        }
+      }
+    }
+  }
 }
 
 /// RGB8 → RGBA8
