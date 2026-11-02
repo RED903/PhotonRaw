@@ -12,10 +12,13 @@ import 'package:image/image.dart' as img;
 
 import 'models/pipeline_params.dart';
 import 'services/pipeline_core.dart';
+import 'services/lens_profile_service.dart';
 import 'services/preset_service.dart';
 import 'services/raw_decoder.dart';
 import 'services/scopes.dart';
+import 'widgets/calibration_widget.dart';
 import 'widgets/color_equalizer_widget.dart';
+import 'widgets/color_grading_widget.dart';
 import 'widgets/control_slider.dart';
 import 'widgets/filmstrip_widget.dart';
 import 'widgets/module_card.dart';
@@ -46,7 +49,7 @@ class PhotonRawApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PhotonRaw v1.0.13 — Pro RAW & Photo Darkroom',
+      title: 'PhotonRaw v1.0.14 — Pro RAW & Photo Darkroom',
       debugShowCheckedModeBanner: false,
       // Windows flutter_windows.dll(0x3c1ca) AccessibilityBridge AXTree 크래시 원천 차단을 위해 Semantics 트리 비활성화
       builder: (context, child) => ExcludeSemantics(
@@ -471,6 +474,15 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           ..wbAsShotTint = bundle.decoded.asShotTint
           ..wbTemperature = bundle.decoded.asShotTemp
           ..wbTint = bundle.decoded.asShotTint;
+
+        final matchedLens = LensProfileService.findBestProfile(
+          cameraName: bundle.decoded.camera,
+          lensModel: bundle.decoded.lensModel,
+        );
+        if (matchedLens != null) {
+          initParams.lensProfileMake = matchedLens.maker;
+          initParams.lensProfileModel = matchedLens.model;
+        }
 
         final fileName = path.split(RegExp(r'[/\\]')).last;
         final photoState = LoadedPhotoState(
@@ -1355,7 +1367,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.13',
+                '⚡ PhotonRaw v1.0.14',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -2256,6 +2268,261 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
       );
     }
 
+    // 1-D. 렌즈 프로필 교정 (Lens Profile Correction — Lensfun / Darktable DB)
+    if (_isModuleVisible(
+      title: '렌즈 프로필 교정 (Lens Profile Correction)',
+      category: 'geometry',
+      enabled: p.lensCorrectionEnabled,
+    )) {
+      final curMaker = p.lensProfileMake.isNotEmpty
+          ? p.lensProfileMake
+          : (LensProfileService.allMakers.contains('Sony') ? 'Sony' : LensProfileService.allMakers.first);
+      final modelsForMaker = LensProfileService.profilesForMaker(curMaker);
+      final curModel = modelsForMaker.any((m) => m.model == p.lensProfileModel)
+          ? p.lensProfileModel
+          : (modelsForMaker.isNotEmpty ? modelsForMaker.first.model : '');
+
+      cards.add(
+        _buildCard(
+          title: '🔍 렌즈 프로필 교정 (Lens Correction)',
+          category: 'geometry',
+          enabled: p.lensCorrectionEnabled,
+          initiallyExpanded: false,
+          onToggleEnabled: (v) => _updateParams(
+            (params) => params.lensCorrectionEnabled = v,
+            recordUndo: true,
+            fast: false,
+          ),
+          onReset: () => _updateParams(
+            (params) {
+              params.lensCorrectionEnabled = false;
+              params.lensDistortionScale = 100.0;
+              params.lensVignetteScale = 100.0;
+              params.lensTcaEnabled = true;
+              params.lensManualDistortion = 0.0;
+              params.lensManualVignette = 0.0;
+              params.lensManualTcaR = 0.0;
+              params.lensManualTcaB = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
+          children: [
+            _smallBtn('⚡ 현재 사진 렌즈 프로필 자동 감지', () {
+              if (_currentPhoto == null) return;
+              final best = LensProfileService.findBestProfile(
+                cameraName: _currentPhoto!.fullDecoded.camera,
+                lensModel: _currentPhoto!.fullDecoded.lensModel,
+              );
+              if (best != null) {
+                _pushUndoSnapshot();
+                _updateParams((params) {
+                  params.lensCorrectionEnabled = true;
+                  params.lensProfileMake = best.maker;
+                  params.lensProfileModel = best.model;
+                }, fast: false);
+                _showSnack('렌즈 프로필 매칭됨: ${best.maker} - ${best.model}');
+              } else {
+                _showSnack('해당 사진에 맞는 렌즈 프로필을 찾지 못했습니다.');
+              }
+            }),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const SizedBox(
+                  width: 52,
+                  child: Text(
+                    '제조사:',
+                    style: TextStyle(fontSize: 11, color: Color(0xFFBBBBBB)),
+                  ),
+                ),
+                Expanded(
+                  child: Container(
+                    height: 28,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF282828),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: const Color(0xFF444444)),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        value: LensProfileService.allMakers.contains(curMaker) ? curMaker : LensProfileService.allMakers.first,
+                        isDense: true,
+                        isExpanded: true,
+                        dropdownColor: const Color(0xFF282828),
+                        style: const TextStyle(fontSize: 11, color: Colors.white),
+                        items: [
+                          for (final m in LensProfileService.allMakers)
+                            DropdownMenuItem(value: m, child: Text(m, overflow: TextOverflow.ellipsis)),
+                        ],
+                        onChanged: (val) {
+                          if (val != null) {
+                            final nextModels = LensProfileService.profilesForMaker(val);
+                            _updateParams((params) {
+                              params.lensCorrectionEnabled = true;
+                              params.lensProfileMake = val;
+                              params.lensProfileModel = nextModels.isNotEmpty ? nextModels.first.model : '';
+                            }, fast: false);
+                          }
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                const SizedBox(
+                  width: 52,
+                  child: Text(
+                    '렌즈 모델:',
+                    style: TextStyle(fontSize: 11, color: Color(0xFFBBBBBB)),
+                  ),
+                ),
+                Expanded(
+                  child: Container(
+                    height: 28,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF282828),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: const Color(0xFF444444)),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        value: modelsForMaker.any((m) => m.model == curModel) ? curModel : (modelsForMaker.isNotEmpty ? modelsForMaker.first.model : null),
+                        isDense: true,
+                        isExpanded: true,
+                        dropdownColor: const Color(0xFF282828),
+                        style: const TextStyle(fontSize: 11, color: Colors.white),
+                        items: [
+                          for (final lp in modelsForMaker)
+                            DropdownMenuItem(value: lp.model, child: Text(lp.model, overflow: TextOverflow.ellipsis)),
+                        ],
+                        onChanged: (val) {
+                          if (val != null) {
+                            _updateParams((params) {
+                              params.lensCorrectionEnabled = true;
+                              params.lensProfileModel = val;
+                            }, fast: false);
+                          }
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            ControlSlider(
+              label: '왜곡 교정 (Distortion)',
+              value: p.lensDistortionScale,
+              min: 0.0,
+              max: 200.0,
+              defaultVal: 100.0,
+              decimals: 0,
+              suffix: '%',
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.lensCorrectionEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.lensDistortionScale = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '비네팅 교정 (Vignetting)',
+              value: p.lensVignetteScale,
+              min: 0.0,
+              max: 200.0,
+              defaultVal: 100.0,
+              decimals: 0,
+              suffix: '%',
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.lensCorrectionEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.lensVignetteScale = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            Row(
+              children: [
+                Checkbox(
+                  value: p.lensTcaEnabled,
+                  activeColor: const Color(0xFFE8A838),
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  onChanged: (v) {
+                    _pushUndoSnapshot();
+                    _updateParams((params) {
+                      params.lensCorrectionEnabled = true;
+                      params.lensTcaEnabled = v ?? true;
+                    }, fast: false);
+                  },
+                ),
+                const Text(
+                  '색수차(TCA) 자동 제거',
+                  style: TextStyle(fontSize: 11, color: Color(0xFFDDDDDD)),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            const Divider(height: 1, color: Color(0xFF333333)),
+            const SizedBox(height: 4),
+            const Text(
+              '수동 미세 조정 (Manual Fine-Tune)',
+              style: TextStyle(fontSize: 10.5, color: Color(0xFF888888), fontWeight: FontWeight.bold),
+            ),
+            ControlSlider(
+              label: '수동 왜곡 (배럴 ↔ 핀쿠션)',
+              value: p.lensManualDistortion,
+              min: -100.0,
+              max: 100.0,
+              defaultVal: 0.0,
+              decimals: 0,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.lensCorrectionEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.lensManualDistortion = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '수동 비네팅 (주변부 광량)',
+              value: p.lensManualVignette,
+              min: -100.0,
+              max: 100.0,
+              defaultVal: 0.0,
+              decimals: 0,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.lensCorrectionEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.lensManualVignette = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '색수차 R/C (Red/Cyan)',
+              value: p.lensManualTcaR,
+              min: -50.0,
+              max: 50.0,
+              defaultVal: 0.0,
+              decimals: 0,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.lensCorrectionEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.lensManualTcaR = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+            ControlSlider(
+              label: '색수차 B/Y (Blue/Yellow)',
+              value: p.lensManualTcaB,
+              min: -50.0,
+              max: 50.0,
+              defaultVal: 0.0,
+              decimals: 0,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.lensCorrectionEnabled = true,
+              onChanged: (v) => _updateParams((params) => params.lensManualTcaB = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+          ],
+        ),
+      );
+    }
+
     // 2. 노출 (Exposure)
     if (_isModuleVisible(
       title: '노출 (Exposure)',
@@ -2920,6 +3187,175 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.colorBalanceEnabled = true,
               onChanged: (v) =>
                   _updateParams((params) => params.cbHighlightsR = v),
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // 11-B. 색 보정 (Color Grading / Split Toning — 1번 사진)
+    if (_isModuleVisible(
+      title: '색 보정 (Color Grading)',
+      category: 'color',
+      enabled: p.colorGradingEnabled,
+    )) {
+      cards.add(
+        _buildCard(
+          title: '🎨 색 보정 (Color Grading)',
+          category: 'color',
+          enabled: p.colorGradingEnabled,
+          initiallyExpanded: false,
+          onToggleEnabled: (v) => _updateParams(
+            (params) => params.colorGradingEnabled = v,
+            recordUndo: true,
+            fast: false,
+          ),
+          onReset: () => _updateParams(
+            (params) {
+              params.colorGradingEnabled = false;
+              params.cgMidtonesHue = 0.0;
+              params.cgMidtonesSat = 0.0;
+              params.cgMidtonesLum = 0.0;
+              params.cgShadowsHue = 0.0;
+              params.cgShadowsSat = 0.0;
+              params.cgShadowsLum = 0.0;
+              params.cgHighlightsHue = 0.0;
+              params.cgHighlightsSat = 0.0;
+              params.cgHighlightsLum = 0.0;
+              params.cgGlobalHue = 0.0;
+              params.cgGlobalSat = 0.0;
+              params.cgGlobalLum = 0.0;
+              params.cgBlending = 50.0;
+              params.cgBalance = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
+          children: [
+            ColorGradingWidget(
+              midtonesHue: p.cgMidtonesHue,
+              midtonesSat: p.cgMidtonesSat,
+              midtonesLum: p.cgMidtonesLum,
+              shadowsHue: p.cgShadowsHue,
+              shadowsSat: p.cgShadowsSat,
+              shadowsLum: p.cgShadowsLum,
+              highlightsHue: p.cgHighlightsHue,
+              highlightsSat: p.cgHighlightsSat,
+              highlightsLum: p.cgHighlightsLum,
+              globalHue: p.cgGlobalHue,
+              globalSat: p.cgGlobalSat,
+              globalLum: p.cgGlobalLum,
+              blending: p.cgBlending,
+              balance: p.cgBalance,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.colorGradingEnabled = true,
+              onChanged: ({
+                midHue,
+                midSat,
+                midLum,
+                shadHue,
+                shadSat,
+                shadLum,
+                highHue,
+                highSat,
+                highLum,
+                globHue,
+                globSat,
+                globLum,
+                blending,
+                balance,
+              }) {
+                _updateParams((params) {
+                  if (midHue != null) params.cgMidtonesHue = midHue;
+                  if (midSat != null) params.cgMidtonesSat = midSat;
+                  if (midLum != null) params.cgMidtonesLum = midLum;
+                  if (shadHue != null) params.cgShadowsHue = shadHue;
+                  if (shadSat != null) params.cgShadowsSat = shadSat;
+                  if (shadLum != null) params.cgShadowsLum = shadLum;
+                  if (highHue != null) params.cgHighlightsHue = highHue;
+                  if (highSat != null) params.cgHighlightsSat = highSat;
+                  if (highLum != null) params.cgHighlightsLum = highLum;
+                  if (globHue != null) params.cgGlobalHue = globHue;
+                  if (globSat != null) params.cgGlobalSat = globSat;
+                  if (globLum != null) params.cgGlobalLum = globLum;
+                  if (blending != null) params.cgBlending = blending;
+                  if (balance != null) params.cgBalance = balance;
+                });
+              },
+              onChangeEnd: () => _triggerRender(fast: false),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // 11-C. 보정 (Calibration — 2번 사진)
+    if (_isModuleVisible(
+      title: '보정 (Calibration)',
+      category: 'color',
+      enabled: p.calibrationEnabled,
+    )) {
+      cards.add(
+        _buildCard(
+          title: '🎛️ 보정 (Calibration)',
+          category: 'color',
+          enabled: p.calibrationEnabled,
+          initiallyExpanded: false,
+          onToggleEnabled: (v) => _updateParams(
+            (params) => params.calibrationEnabled = v,
+            recordUndo: true,
+            fast: false,
+          ),
+          onReset: () => _updateParams(
+            (params) {
+              params.calibrationEnabled = false;
+              params.calibShadowsTint = 0.0;
+              params.calibRedHue = 0.0;
+              params.calibRedSat = 0.0;
+              params.calibGreenHue = 0.0;
+              params.calibGreenSat = 0.0;
+              params.calibBlueHue = 0.0;
+              params.calibBlueSat = 0.0;
+            },
+            recordUndo: true,
+            fast: false,
+          ),
+          children: [
+            CalibrationWidget(
+              processVersion: p.calibVersion,
+              shadowsTint: p.calibShadowsTint,
+              redHue: p.calibRedHue,
+              redSat: p.calibRedSat,
+              greenHue: p.calibGreenHue,
+              greenSat: p.calibGreenSat,
+              blueHue: p.calibBlueHue,
+              blueSat: p.calibBlueSat,
+              onChangeStart: _pushUndoSnapshot,
+              onAutoTurnOn: () => p.calibrationEnabled = true,
+              onProcessVersionChanged: (v) {
+                _pushUndoSnapshot();
+                _updateParams((params) => params.calibVersion = v, fast: false);
+              },
+              onChanged: ({
+                shadowsTint,
+                redHue,
+                redSat,
+                greenHue,
+                greenSat,
+                blueHue,
+                blueSat,
+              }) {
+                _updateParams((params) {
+                  if (shadowsTint != null) params.calibShadowsTint = shadowsTint;
+                  if (redHue != null) params.calibRedHue = redHue;
+                  if (redSat != null) params.calibRedSat = redSat;
+                  if (greenHue != null) params.calibGreenHue = greenHue;
+                  if (greenSat != null) params.calibGreenSat = greenSat;
+                  if (blueHue != null) params.calibBlueHue = blueHue;
+                  if (blueSat != null) params.calibBlueSat = blueSat;
+                });
+              },
               onChangeEnd: () => _triggerRender(fast: false),
             ),
           ],

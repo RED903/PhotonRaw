@@ -5,10 +5,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:photon_raw/main.dart';
 import 'package:photon_raw/models/pipeline_params.dart';
 import 'package:photon_raw/services/curve_lut.dart';
+import 'package:photon_raw/services/lens_profile_service.dart';
 import 'package:photon_raw/services/pipeline_core.dart';
 import 'package:photon_raw/services/raw_decoder.dart';
 import 'package:photon_raw/services/scopes.dart';
+import 'package:photon_raw/widgets/calibration_widget.dart';
 import 'package:photon_raw/widgets/color_equalizer_widget.dart';
+import 'package:photon_raw/widgets/color_grading_widget.dart';
 import 'package:photon_raw/widgets/tone_curve_widget.dart';
 
 void main() {
@@ -318,7 +321,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1440, 900));
     await tester.pumpWidget(const PhotonRawApp());
-    expect(find.text('⚡ PhotonRaw v1.0.13'), findsOneWidget);
+    expect(find.text('⚡ PhotonRaw v1.0.14'), findsOneWidget);
     expect(find.text('사진 또는 RAW 파일을 불러오세요'), findsOneWidget);
 
     // 0. 상단 바에서 '📋 복사', '📌 붙여넣기', '📌 전체 적용' 및 외부 프리셋 드롭다운이 제거되고 '⚙️ 프리셋 관리'와 '🌐 격자 표시'가 상단에 있는지 검증
@@ -495,5 +498,113 @@ void main() {
     await tester.pump();
     expect(scrollController.offset, equals(0.0));
     expect(eqHue[3], greaterThan(0.35));
+  });
+
+  test('스팟 리무버: 가산 백화 현상 제거 및 블랙 포인트/대비 보존 검증', () {
+    const w = 40, h = 40;
+    final rgb = Uint8List(w * h * 3)..fillRange(0, w * h * 3, 100);
+    // 소스 영역 중앙에 순수 블랙 픽셀 배치
+    final sx = 30, sy = 20;
+    rgb[(sy * w + sx) * 3] = 0;
+    rgb[(sy * w + sx) * 3 + 1] = 0;
+    rgb[(sy * w + sx) * 3 + 2] = 0;
+
+    final p = PipelineParams()
+      ..spotEnabled = true
+      ..spots = [
+        Spot(x: 10 / w, y: 20 / h, r: 0.15, srcX: sx / w, srcY: sy / h),
+      ];
+    final out = renderPreview(ProxyImage(w, h, rgb), p);
+    // 타겟 중심(10, 20)에 소스의 블랙 픽셀이 복제되었을 때, 가산 오프셋으로 인해 허옇게 뜨지 않고 0에 가깝게 유지되어야 함
+    final targetIdx = (20 * w + 10) * 4;
+    expect(out.rgba[targetIdx], lessThan(5));
+    expect(out.rgba[targetIdx + 1], lessThan(5));
+    expect(out.rgba[targetIdx + 2], lessThan(5));
+  });
+
+  test('색 보정 (Color Grading) 3-Way 휠, 휘도, 혼합, 균형 연산 검증', () {
+    const w = 20, h = 20;
+    final rgb = Uint8List(w * h * 3)..fillRange(0, w * h * 3, 128);
+    final proxy = ProxyImage(w, h, rgb);
+
+    final p = PipelineParams()
+      ..colorGradingEnabled = true
+      ..cgMidtonesHue = 120.0 // Green
+      ..cgMidtonesSat = 80.0
+      ..cgShadowsHue = 240.0 // Blue
+      ..cgShadowsSat = 80.0
+      ..cgHighlightsHue = 0.0 // Red
+      ..cgHighlightsSat = 80.0
+      ..cgBlending = 50.0
+      ..cgBalance = 0.0;
+
+    final out = renderPreview(proxy, p);
+    expect(out.rgba.length, w * h * 4);
+    // 중간톤(128)에서는 Green 성분이 R, B보다 확실히 커야 함
+    final midIdx = ((h ~/ 2) * w + (w ~/ 2)) * 4;
+    expect(out.rgba[midIdx + 1], greaterThan(out.rgba[midIdx]));
+    expect(out.rgba[midIdx + 1], greaterThan(out.rgba[midIdx + 2]));
+
+    // 직렬화 왕복 검증
+    final m = p.toMap();
+    final restored = PipelineParams.fromMap(m);
+    expect(restored.cgMidtonesHue, equals(120.0));
+    expect(restored.cgMidtonesSat, equals(80.0));
+  });
+
+  test('보정 (Calibration) 어두운 영역 틴트 및 RGB 기본 색조/채도 시프트 검증', () {
+    const w = 20, h = 20;
+    final rgb = Uint8List(w * h * 3);
+    for (int i = 0; i < w * h * 3; i += 3) {
+      rgb[i] = 200; // Red 우세 픽셀
+      rgb[i + 1] = 60;
+      rgb[i + 2] = 60;
+    }
+    final proxy = ProxyImage(w, h, rgb);
+
+    final p = PipelineParams()
+      ..calibrationEnabled = true
+      ..calibRedHue = 50.0 // Red Hue 양수 시 오렌지/옐로우 쪽(Green 증가)으로 시프트
+      ..calibBlueSat = 50.0
+      ..calibShadowsTint = -40.0; // 그림자 그린 틴트
+
+    final out = renderPreview(proxy, p);
+    expect(out.rgba.length, w * h * 4);
+    // Red Hue가 50이면 G 성분이 원본보다 증가함
+    expect(out.rgba[1], greaterThan(60));
+
+    // 직렬화 왕복 검증
+    final restored = PipelineParams.fromMap(p.toMap());
+    expect(restored.calibRedHue, equals(50.0));
+    expect(restored.calibShadowsTint, equals(-40.0));
+  });
+
+  test('렌즈 프로필 교정 (Lens Profile Correction) 왜곡/비네팅/TCA 검증', () {
+    LensProfileService.ensureInitialized();
+    expect(LensProfileService.allProfiles.isNotEmpty, isTrue);
+    expect(LensProfileService.allMakers.contains('Sony'), isTrue);
+
+    const w = 40, h = 40;
+    final rgb = Uint8List(w * h * 3)..fillRange(0, w * h * 3, 100);
+    final proxy = ProxyImage(w, h, rgb);
+
+    final p = PipelineParams()
+      ..lensCorrectionEnabled = true
+      ..lensProfileMake = 'Sony'
+      ..lensProfileModel = 'FE 24-70mm F2.8 GM (SEL2470GM)'
+      ..lensDistortionScale = 100.0
+      ..lensVignetteScale = 100.0
+      ..lensTcaEnabled = true;
+
+    final out = renderPreview(proxy, p);
+    expect(out.rgba.length, w * h * 4);
+    // 비네팅 복원으로 인해 모서리 픽셀이 중앙 픽셀(100)보다 밝아져야 함 (비네팅 역보정)
+    final cornerIdx = (0 * w + 0) * 4;
+    expect(out.rgba[cornerIdx], greaterThan(100));
+
+    // 직렬화 왕복 검증
+    final restored = PipelineParams.fromMap(p.toMap());
+    expect(restored.lensCorrectionEnabled, isTrue);
+    expect(restored.lensProfileModel, equals('FE 24-70mm F2.8 GM (SEL2470GM)'));
   });
 }

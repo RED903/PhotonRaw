@@ -19,6 +19,9 @@ class DecodedImage {
   final bool isRaw;
   final int bitDepth;
   final String camera;
+  final String lensModel;
+  final double focalLength;
+  final double aperture;
   final String note;
   final double asShotTemp;
   final double asShotTint;
@@ -35,6 +38,9 @@ class DecodedImage {
     required this.isRaw,
     required this.bitDepth,
     required this.camera,
+    this.lensModel = '',
+    this.focalLength = 0.0,
+    this.aperture = 0.0,
     required this.note,
     this.asShotTemp = 6500.0,
     this.asShotTint = 0.0,
@@ -105,10 +111,19 @@ DecodedImage decodeImageFile(String path) {
   }
   img.Image image = decoded;
   var camera = '';
+  var lensModel = '';
+  double focalLength = 0.0;
+  double aperture = 0.0;
   try {
     final make = image.exif.imageIfd.make ?? '';
     final model = image.exif.imageIfd.model ?? '';
     camera = '$make $model'.trim();
+    final exif = image.exif;
+    lensModel = exif.getTag(0xA434)?.toString() ?? '';
+    final tagFocal = exif.getTag(0x920A);
+    if (tagFocal != null) focalLength = double.tryParse(tagFocal.toString()) ?? 0.0;
+    final tagFNum = exif.getTag(0x829D);
+    if (tagFNum != null) aperture = double.tryParse(tagFNum.toString()) ?? 0.0;
   } catch (_) {}
   try {
     image = img.bakeOrientation(image);
@@ -143,6 +158,9 @@ DecodedImage decodeImageFile(String path) {
     isRaw: false,
     bitDepth: is16BitImg ? 16 : 8,
     camera: camera.isEmpty ? '일반 이미지' : camera,
+    lensModel: lensModel,
+    focalLength: focalLength,
+    aperture: aperture,
     note: is16BitImg ? '16-bit 무손실 이미지' : '8-bit 표준 이미지',
     rgb: _toRgbBytes(image),
     linearRgb: linearF32,
@@ -748,6 +766,8 @@ class _PureDartBayerRawDecoder {
     final make = tiff.ascii(tiff.ifd0, 0x010F) ?? '';
     final model = tiff.ascii(tiff.ifd0, 0x0110) ?? '';
     final camera = '$make $model'.trim();
+    final exifIfdOffset = tiff.readIntTag(tiff.ifd0, 0x8769);
+    final lens = exifIfdOffset != null ? (tiff.ascii(exifIfdOffset, 0xA434) ?? '') : '';
 
     return DecodedImage(
       name: name,
@@ -759,6 +779,7 @@ class _PureDartBayerRawDecoder {
       isRaw: true,
       bitDepth: actualBitDepth,
       camera: camera.isEmpty ? '${ext.toUpperCase()} RAW' : camera,
+      lensModel: lens,
       note: '✅ $actualBitDepth-bit 센서 RAW (32-bit Float 선형 파이프라인)',
       asShotTemp: asShotTemp,
       asShotTint: asShotTint,

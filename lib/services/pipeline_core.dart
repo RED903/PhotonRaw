@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import '../models/pipeline_params.dart';
 import 'curve_lut.dart';
+import 'lens_profile_service.dart';
 
 /// 선형 RGB 32-bit float 이미지 (RGB 인터리브)
 class FloatImage {
@@ -247,6 +248,7 @@ class ColorMath {
 // ───────────────────────── 기하학 ─────────────────────────
 
 FloatImage applyGeometry(FloatImage src, PipelineParams p, {bool ignoreAngle = false}) {
+  if (p.lensCorrectionEnabled) src = applyLensCorrection(src, p);
   var img = src;
   if (p.rotate90 == 90 || p.rotate90 == 180 || p.rotate90 == 270) {
     img = _rotate90(img, p.rotate90);
@@ -540,8 +542,18 @@ void _colorStage(Float32List buf, int w, int h, PipelineParams p) {
   final cbActive = p.colorBalanceEnabled &&
       (p.cbShadowsR != 0 || p.cbMidtonesG != 0 || p.cbMidtonesB != 0 || p.cbHighlightsR != 0);
   final dfActive = p.defringeEnabled && p.dfStrength > 0;
+  final cgActive = p.colorGradingEnabled &&
+      (p.cgMidtonesSat > 0 || p.cgMidtonesLum != 0 ||
+          p.cgShadowsSat > 0 || p.cgShadowsLum != 0 ||
+          p.cgHighlightsSat > 0 || p.cgHighlightsLum != 0 ||
+          p.cgGlobalSat > 0 || p.cgGlobalLum != 0);
+  final calibActive = p.calibrationEnabled &&
+      (p.calibShadowsTint != 0 ||
+          p.calibRedHue != 0 || p.calibRedSat != 0 ||
+          p.calibGreenHue != 0 || p.calibGreenSat != 0 ||
+          p.calibBlueHue != 0 || p.calibBlueSat != 0);
 
-  if (!(needsAces || tcActive || dehazeActive || satActive || ceqActive || cbActive || dfActive)) {
+  if (!(needsAces || tcActive || dehazeActive || satActive || ceqActive || cbActive || dfActive || cgActive || calibActive)) {
     return;
   }
 
@@ -554,6 +566,53 @@ void _colorStage(Float32List buf, int w, int h, PipelineParams p) {
   final sigDenom = math.max(0.0001, sigS1 - sigS0);
   final shExp = 1.0 - p.sigShoulder * 0.4;
   final toeExp = 1.0 + p.sigToe * 0.4;
+
+  // 색 보정 (Color Grading) 사전 계산
+  var cgMidR = 0.0, cgMidG = 0.0, cgMidB = 0.0, cgMidL = 0.0;
+  var cgShadR = 0.0, cgShadG = 0.0, cgShadB = 0.0, cgShadL = 0.0;
+  var cgHighR = 0.0, cgHighG = 0.0, cgHighB = 0.0, cgHighL = 0.0;
+  var cgGlobR = 0.0, cgGlobG = 0.0, cgGlobB = 0.0, cgGlobL = 0.0;
+  var cgPivot = 0.5;
+  var cgSpan = 0.30;
+  if (cgActive) {
+    (double, double, double) tintRgb(double hueDeg, double satPct) {
+      if (satPct <= 0.0) return (0.0, 0.0, 0.0);
+      final h = ((hueDeg % 360.0) + 360.0) % 360.0 / 360.0;
+      final s = (satPct / 100.0).clamp(0.0, 1.0);
+      final ctmp = Float64List(3);
+      _hsl2rgb(h, s, 0.5, ctmp);
+      return ((ctmp[0] - 0.5) * 2.0, (ctmp[1] - 0.5) * 2.0, (ctmp[2] - 0.5) * 2.0);
+    }
+    final tMid = tintRgb(p.cgMidtonesHue, p.cgMidtonesSat);
+    cgMidR = tMid.$1; cgMidG = tMid.$2; cgMidB = tMid.$3;
+    cgMidL = p.cgMidtonesLum / 100.0 * 0.25;
+
+    final tShad = tintRgb(p.cgShadowsHue, p.cgShadowsSat);
+    cgShadR = tShad.$1; cgShadG = tShad.$2; cgShadB = tShad.$3;
+    cgShadL = p.cgShadowsLum / 100.0 * 0.25;
+
+    final tHigh = tintRgb(p.cgHighlightsHue, p.cgHighlightsSat);
+    cgHighR = tHigh.$1; cgHighG = tHigh.$2; cgHighB = tHigh.$3;
+    cgHighL = p.cgHighlightsLum / 100.0 * 0.25;
+
+    final tGlob = tintRgb(p.cgGlobalHue, p.cgGlobalSat);
+    cgGlobR = tGlob.$1; cgGlobG = tGlob.$2; cgGlobB = tGlob.$3;
+    cgGlobL = p.cgGlobalLum / 100.0 * 0.25;
+
+    final bal = (p.cgBalance / 100.0).clamp(-1.0, 1.0);
+    cgPivot = (0.5 - bal * 0.25).clamp(0.1, 0.9);
+    final blend = (p.cgBlending / 100.0).clamp(0.0, 1.0);
+    cgSpan = 0.15 + blend * 0.35;
+  }
+
+  // 보정 (Calibration) 사전 계산
+  final calibShadTint = p.calibShadowsTint / 100.0;
+  final calibRH = p.calibRedHue / 100.0;
+  final calibRS = p.calibRedSat / 100.0;
+  final calibGH = p.calibGreenHue / 100.0;
+  final calibGS = p.calibGreenSat / 100.0;
+  final calibBH = p.calibBlueHue / 100.0;
+  final calibBS = p.calibBlueSat / 100.0;
 
   final dTint = wbRel.deltaTint;
   final wbGain = wbRel.gain;
@@ -789,6 +848,63 @@ void _colorStage(Float32List buf, int w, int h, PipelineParams p) {
       g += p.cbMidtonesG * wMid * 0.35;
       b += p.cbMidtonesB * wMid * 0.35;
       r += p.cbHighlightsR * wHi * 0.35;
+    }
+
+    // 색 보정 (Color Grading / Split Toning)
+    if (cgActive) {
+      final linLum = r * 0.2126 + g * 0.7152 + b * 0.0722;
+      final percLum = _fastPowInv22(linLum); // 지각적 감마(sRGB) 기준 인간 시각 영역 분할
+      var wSh = ((cgPivot - percLum) / cgSpan).clamp(0.0, 1.0);
+      wSh = wSh * wSh * (3.0 - 2.0 * wSh);
+      var wHi = ((percLum - cgPivot) / cgSpan).clamp(0.0, 1.0);
+      wHi = wHi * wHi * (3.0 - 2.0 * wHi);
+      final wMid = math.max(0.0, 1.0 - wSh - wHi);
+
+      r += wSh * (cgShadR * 0.35 + cgShadL) +
+          wMid * (cgMidR * 0.35 + cgMidL) +
+          wHi * (cgHighR * 0.35 + cgHighL) +
+          (cgGlobR * 0.35 + cgGlobL);
+      g += wSh * (cgShadG * 0.35 + cgShadL) +
+          wMid * (cgMidG * 0.35 + cgMidL) +
+          wHi * (cgHighG * 0.35 + cgHighL) +
+          (cgGlobG * 0.35 + cgGlobL);
+      b += wSh * (cgShadB * 0.35 + cgShadL) +
+          wMid * (cgMidB * 0.35 + cgMidL) +
+          wHi * (cgHighB * 0.35 + cgHighL) +
+          (cgGlobB * 0.35 + cgGlobL);
+    }
+
+    // 보정 (Calibration)
+    if (calibActive) {
+      final lum = r * 0.2126 + g * 0.7152 + b * 0.0722;
+      if (calibShadTint != 0.0) {
+        final wSh = (1.0 - lum * 2.2).clamp(0.0, 1.0);
+        final t = calibShadTint * 0.12 * wSh * wSh;
+        g -= t;
+        r += t * 0.5;
+        b += t * 0.5;
+      }
+      if (calibRH != 0.0 || calibRS != 0.0) {
+        final rMax = math.max(0.0, r - math.max(g, b));
+        final rW = rMax / math.max(0.001, r);
+        g += r * calibRH * 0.25 * rW;
+        b -= r * calibRH * 0.25 * rW;
+        r += (r - (g + b) * 0.5) * calibRS * 0.55 * rW;
+      }
+      if (calibGH != 0.0 || calibGS != 0.0) {
+        final gMax = math.max(0.0, g - math.max(r, b));
+        final gW = gMax / math.max(0.001, g);
+        b += g * calibGH * 0.25 * gW;
+        r -= g * calibGH * 0.25 * gW;
+        g += (g - (r + b) * 0.5) * calibGS * 0.55 * gW;
+      }
+      if (calibBH != 0.0 || calibBS != 0.0) {
+        final bMax = math.max(0.0, b - math.max(r, g));
+        final bW = bMax / math.max(0.001, b);
+        g += b * calibBH * 0.25 * bW;
+        r -= b * calibBH * 0.25 * bW;
+        b += (b - (r + g) * 0.5) * calibBS * 0.65 * bW;
+      }
     }
 
     // 디프린지
@@ -1452,7 +1568,7 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
 
     // 경계 링(1.0r ~ 1.4r)에서 타겟 주변 평균색과 소스 주변 평균색의 차이를 구해
     // 소스 패치의 저주파 밝기/색을 주변에 맞춤 (시임리스 클론)
-    var deltaR = 0.0, deltaG = 0.0, deltaB = 0.0;
+    var gainR = 1.0, gainG = 1.0, gainB = 1.0;
     {
       final ringOuterSq = (r * 1.4) * (r * 1.4);
       final rx0 = math.max(0, (minX - r * 1.4).floor());
@@ -1460,8 +1576,13 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
       final ry0 = math.max(0, (minY - r * 1.4).floor());
       final ry1 = math.min(h - 1, (maxY + r * 1.4).ceil());
       final stride = math.max(1, (r / 10).floor());
-      var tR = 0.0, tG = 0.0, tB = 0.0, sR = 0.0, sG = 0.0, sB = 0.0;
-      var n = 0;
+      final tListR = <double>[];
+      final tListG = <double>[];
+      final tListB = <double>[];
+      final sListR = <double>[];
+      final sListG = <double>[];
+      final sListB = <double>[];
+
       for (var y = ry0; y <= ry1; y += stride) {
         for (var x = rx0; x <= rx1; x += stride) {
           final d2 = distSqAt(x.toDouble(), y.toDouble());
@@ -1470,19 +1591,45 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
           final syp = (y + offY).clamp(0, h - 1);
           final si = (syp * w + sxp) * 3;
           final di = (y * w + x) * 3;
-          tR += buf[di];
-          tG += buf[di + 1];
-          tB += buf[di + 2];
-          sR += buf[si];
-          sG += buf[si + 1];
-          sB += buf[si + 2];
-          n++;
+          tListR.add(buf[di]);
+          tListG.add(buf[di + 1]);
+          tListB.add(buf[di + 2]);
+          sListR.add(buf[si]);
+          sListG.add(buf[si + 1]);
+          sListB.add(buf[si + 2]);
+
         }
       }
-      if (n >= 6) {
-        deltaR = ((tR - sR) / n).clamp(-0.25, 0.25);
-        deltaG = ((tG - sG) / n).clamp(-0.25, 0.25);
-        deltaB = ((tB - sB) / n).clamp(-0.25, 0.25);
+      double trimmedMean(List<double> list) {
+        if (list.isEmpty) return 0.0;
+        if (list.length < 5) {
+          var sum = 0.0;
+          for (final v in list) sum += v;
+          return sum / list.length;
+        }
+        list.sort();
+        final trim = (list.length * 0.15).floor();
+        var sum = 0.0;
+        var count = 0;
+        for (var i = trim; i < list.length - trim; i++) {
+          sum += list[i];
+          count++;
+        }
+        return count > 0 ? sum / count : list[list.length ~/ 2];
+      }
+      if (tListR.length >= 6) {
+        final tMeanR = trimmedMean(tListR);
+        final tMeanG = trimmedMean(tListG);
+        final tMeanB = trimmedMean(tListB);
+        final sMeanR = trimmedMean(sListR);
+        final sMeanG = trimmedMean(sListG);
+        final sMeanB = trimmedMean(sListB);
+        final tLum = tMeanR * 0.2126 + tMeanG * 0.7152 + tMeanB * 0.0722;
+        final sLum = sMeanR * 0.2126 + sMeanG * 0.7152 + sMeanB * 0.0722;
+        final baseGain = (tLum / math.max(0.005, sLum)).clamp(0.85, 1.18);
+        gainR = (sMeanR > 0.005 ? (tMeanR / sMeanR * 0.5 + baseGain * 0.5) : baseGain).clamp(0.82, 1.22);
+        gainG = (sMeanG > 0.005 ? (tMeanG / sMeanG * 0.5 + baseGain * 0.5) : baseGain).clamp(0.82, 1.22);
+        gainB = (sMeanB > 0.005 ? (tMeanB / sMeanB * 0.5 + baseGain * 0.5) : baseGain).clamp(0.82, 1.22);
       }
     }
 
@@ -1506,9 +1653,9 @@ void _applySpots(Float32List buf, int w, int h, List<Spot> spots) {
         final syp = (y + offY).clamp(0, h - 1);
         final si = (syp * w + sxp) * 3;
         final di = (y * w + x) * 3;
-        final cr = math.max(0.0, buf[si] + deltaR);
-        final cg = math.max(0.0, buf[si + 1] + deltaG);
-        final cb = math.max(0.0, buf[si + 2] + deltaB);
+        final cr = buf[si] * gainR;
+        final cg = buf[si + 1] * gainG;
+        final cb = buf[si + 2] * gainB;
         snapshot[di] = (
           buf[di] * (1.0 - wt) + cr * wt,
           buf[di + 1] * (1.0 - wt) + cg * wt,

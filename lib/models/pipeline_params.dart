@@ -183,6 +183,46 @@ class PipelineParams {
   double cbMidtonesB = 0.0;
   double cbHighlightsR = 0.0;
 
+  // 색 보정 (Color Grading / Split Toning - 3-Way & Global)
+  bool colorGradingEnabled = false;
+  double cgMidtonesHue = 0.0; // 0 ~ 360
+  double cgMidtonesSat = 0.0; // 0 ~ 100
+  double cgMidtonesLum = 0.0; // -100 ~ 100
+  double cgShadowsHue = 0.0;
+  double cgShadowsSat = 0.0;
+  double cgShadowsLum = 0.0;
+  double cgHighlightsHue = 0.0;
+  double cgHighlightsSat = 0.0;
+  double cgHighlightsLum = 0.0;
+  double cgGlobalHue = 0.0;
+  double cgGlobalSat = 0.0;
+  double cgGlobalLum = 0.0;
+  double cgBlending = 50.0; // 0 ~ 100 (혼합)
+  double cgBalance = 0.0; // -100 ~ 100 (균형)
+
+  // 보정 (Calibration - Camera Calibration)
+  bool calibrationEnabled = false;
+  String calibVersion = '버전 6(현재)';
+  double calibShadowsTint = 0.0; // -100 ~ 100 (그린 <-> 마젠타)
+  double calibRedHue = 0.0; // -100 ~ 100
+  double calibRedSat = 0.0; // -100 ~ 100
+  double calibGreenHue = 0.0; // -100 ~ 100
+  double calibGreenSat = 0.0; // -100 ~ 100
+  double calibBlueHue = 0.0; // -100 ~ 100
+  double calibBlueSat = 0.0; // -100 ~ 100
+
+  // 렌즈 프로필 교정 (Lens Profile Correction - Lensfun / Darktable DB)
+  bool lensCorrectionEnabled = false;
+  String lensProfileMake = '';
+  String lensProfileModel = '';
+  double lensDistortionScale = 100.0; // 0 ~ 200%
+  double lensVignetteScale = 100.0; // 0 ~ 200%
+  bool lensTcaEnabled = true;
+  double lensManualDistortion = 0.0; // -100 ~ 100
+  double lensManualVignette = 0.0; // -100 ~ 100
+  double lensManualTcaR = 0.0; // -50 ~ 50
+  double lensManualTcaB = 0.0; // -50 ~ 50
+
   // 디테일 모듈
   bool sharpenEnabled = false;
   double shAmount = 0.0;
@@ -282,6 +322,40 @@ class PipelineParams {
         'cb_midtones_g': cbMidtonesG,
         'cb_midtones_b': cbMidtonesB,
         'cb_highlights_r': cbHighlightsR,
+        'color_grading_enabled': colorGradingEnabled,
+        'cg_midtones_hue': cgMidtonesHue,
+        'cg_midtones_sat': cgMidtonesSat,
+        'cg_midtones_lum': cgMidtonesLum,
+        'cg_shadows_hue': cgShadowsHue,
+        'cg_shadows_sat': cgShadowsSat,
+        'cg_shadows_lum': cgShadowsLum,
+        'cg_highlights_hue': cgHighlightsHue,
+        'cg_highlights_sat': cgHighlightsSat,
+        'cg_highlights_lum': cgHighlightsLum,
+        'cg_global_hue': cgGlobalHue,
+        'cg_global_sat': cgGlobalSat,
+        'cg_global_lum': cgGlobalLum,
+        'cg_blending': cgBlending,
+        'cg_balance': cgBalance,
+        'calibration_enabled': calibrationEnabled,
+        'calib_version': calibVersion,
+        'calib_shadows_tint': calibShadowsTint,
+        'calib_red_hue': calibRedHue,
+        'calib_red_sat': calibRedSat,
+        'calib_green_hue': calibGreenHue,
+        'calib_green_sat': calibGreenSat,
+        'calib_blue_hue': calibBlueHue,
+        'calib_blue_sat': calibBlueSat,
+        'lens_correction_enabled': lensCorrectionEnabled,
+        'lens_profile_make': lensProfileMake,
+        'lens_profile_model': lensProfileModel,
+        'lens_distortion_scale': lensDistortionScale,
+        'lens_vignette_scale': lensVignetteScale,
+        'lens_tca_enabled': lensTcaEnabled,
+        'lens_manual_distortion': lensManualDistortion,
+        'lens_manual_vignette': lensManualVignette,
+        'lens_manual_tca_r': lensManualTcaR,
+        'lens_manual_tca_b': lensManualTcaB,
         'sharpen_enabled': sharpenEnabled,
         'sh_amount': shAmount,
         'local_contrast_enabled': localContrastEnabled,
@@ -393,6 +467,48 @@ class PipelineParams {
     if (m.containsKey('cb_midtones_g')) cbMidtonesG = _d(m['cb_midtones_g'], cbMidtonesG);
     if (m.containsKey('cb_midtones_b')) cbMidtonesB = _d(m['cb_midtones_b'], cbMidtonesB);
     if (m.containsKey('cb_highlights_r')) cbHighlightsR = _d(m['cb_highlights_r'], cbHighlightsR);
+    if (m.containsKey('color_grading_enabled')) {
+      colorGradingEnabled = _b(m['color_grading_enabled'], colorGradingEnabled);
+    }
+    if (m.containsKey('cg_midtones_hue')) cgMidtonesHue = _d(m['cg_midtones_hue'], cgMidtonesHue);
+    if (m.containsKey('cg_midtones_sat')) cgMidtonesSat = _d(m['cg_midtones_sat'], cgMidtonesSat);
+    if (m.containsKey('cg_midtones_lum')) cgMidtonesLum = _d(m['cg_midtones_lum'], cgMidtonesLum);
+    if (m.containsKey('cg_shadows_hue')) cgShadowsHue = _d(m['cg_shadows_hue'], cgShadowsHue);
+    if (m.containsKey('cg_shadows_sat')) cgShadowsSat = _d(m['cg_shadows_sat'], cgShadowsSat);
+    if (m.containsKey('cg_shadows_lum')) cgShadowsLum = _d(m['cg_shadows_lum'], cgShadowsLum);
+    if (m.containsKey('cg_highlights_hue')) cgHighlightsHue = _d(m['cg_highlights_hue'], cgHighlightsHue);
+    if (m.containsKey('cg_highlights_sat')) cgHighlightsSat = _d(m['cg_highlights_sat'], cgHighlightsSat);
+    if (m.containsKey('cg_highlights_lum')) cgHighlightsLum = _d(m['cg_highlights_lum'], cgHighlightsLum);
+    if (m.containsKey('cg_global_hue')) cgGlobalHue = _d(m['cg_global_hue'], cgGlobalHue);
+    if (m.containsKey('cg_global_sat')) cgGlobalSat = _d(m['cg_global_sat'], cgGlobalSat);
+    if (m.containsKey('cg_global_lum')) cgGlobalLum = _d(m['cg_global_lum'], cgGlobalLum);
+    if (m.containsKey('cg_blending')) cgBlending = _d(m['cg_blending'], cgBlending);
+    if (m.containsKey('cg_balance')) cgBalance = _d(m['cg_balance'], cgBalance);
+
+    if (m.containsKey('calibration_enabled')) {
+      calibrationEnabled = _b(m['calibration_enabled'], calibrationEnabled);
+    }
+    if (m.containsKey('calib_version')) calibVersion = m['calib_version']?.toString() ?? calibVersion;
+    if (m.containsKey('calib_shadows_tint')) calibShadowsTint = _d(m['calib_shadows_tint'], calibShadowsTint);
+    if (m.containsKey('calib_red_hue')) calibRedHue = _d(m['calib_red_hue'], calibRedHue);
+    if (m.containsKey('calib_red_sat')) calibRedSat = _d(m['calib_red_sat'], calibRedSat);
+    if (m.containsKey('calib_green_hue')) calibGreenHue = _d(m['calib_green_hue'], calibGreenHue);
+    if (m.containsKey('calib_green_sat')) calibGreenSat = _d(m['calib_green_sat'], calibGreenSat);
+    if (m.containsKey('calib_blue_hue')) calibBlueHue = _d(m['calib_blue_hue'], calibBlueHue);
+    if (m.containsKey('calib_blue_sat')) calibBlueSat = _d(m['calib_blue_sat'], calibBlueSat);
+
+    if (m.containsKey('lens_correction_enabled')) {
+      lensCorrectionEnabled = _b(m['lens_correction_enabled'], lensCorrectionEnabled);
+    }
+    if (m.containsKey('lens_profile_make')) lensProfileMake = m['lens_profile_make']?.toString() ?? lensProfileMake;
+    if (m.containsKey('lens_profile_model')) lensProfileModel = m['lens_profile_model']?.toString() ?? lensProfileModel;
+    if (m.containsKey('lens_distortion_scale')) lensDistortionScale = _d(m['lens_distortion_scale'], lensDistortionScale);
+    if (m.containsKey('lens_vignette_scale')) lensVignetteScale = _d(m['lens_vignette_scale'], lensVignetteScale);
+    if (m.containsKey('lens_tca_enabled')) lensTcaEnabled = _b(m['lens_tca_enabled'], lensTcaEnabled);
+    if (m.containsKey('lens_manual_distortion')) lensManualDistortion = _d(m['lens_manual_distortion'], lensManualDistortion);
+    if (m.containsKey('lens_manual_vignette')) lensManualVignette = _d(m['lens_manual_vignette'], lensManualVignette);
+    if (m.containsKey('lens_manual_tca_r')) lensManualTcaR = _d(m['lens_manual_tca_r'], lensManualTcaR);
+    if (m.containsKey('lens_manual_tca_b')) lensManualTcaB = _d(m['lens_manual_tca_b'], lensManualTcaB);
     if (m.containsKey('sharpen_enabled')) sharpenEnabled = _b(m['sharpen_enabled'], sharpenEnabled);
     if (m.containsKey('sh_amount')) shAmount = _d(m['sh_amount'], shAmount);
     if (m.containsKey('local_contrast_enabled')) {
