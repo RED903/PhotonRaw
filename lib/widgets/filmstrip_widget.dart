@@ -17,6 +17,7 @@ class FilmstripItemData {
 /// SemiDarktable의 하단 Filmstrip 바 1:1 이식
 /// - 사진이 없을 때는 26px 헤더 바만 표시하여 뷰포트 공간을 침범하지 않음
 /// - 접기/펼치기 토글, 사진 클릭 전환, 개별 사진 닫기(✕) 버튼 제공
+/// - 우클릭(데스크톱) 및 길게 누르기(모바일)를 통한 현상 설정 복사/붙여넣기 지원 (변형 세팅 제외)
 class FilmstripWidget extends StatelessWidget {
   final List<FilmstripItemData> items;
   final int currentIndex;
@@ -25,6 +26,9 @@ class FilmstripWidget extends StatelessWidget {
   final ValueChanged<int> onSelect;
   final ValueChanged<int> onRemove;
   final VoidCallback onAddFiles;
+  final ValueChanged<int>? onCopySettings;
+  final ValueChanged<int>? onPasteSettings;
+  final bool hasCopiedSettings;
 
   const FilmstripWidget({
     super.key,
@@ -35,7 +39,89 @@ class FilmstripWidget extends StatelessWidget {
     required this.onSelect,
     required this.onRemove,
     required this.onAddFiles,
+    this.onCopySettings,
+    this.onPasteSettings,
+    this.hasCopiedSettings = false,
   });
+
+  void _showContextMenu(BuildContext context, Offset globalPos, int idx) async {
+    final RenderBox overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox;
+    final RelativeRect position = RelativeRect.fromRect(
+      Rect.fromPoints(globalPos, globalPos),
+      Offset.zero & overlay.size,
+    );
+
+    final selected = await showMenu<String>(
+      context: context,
+      position: position,
+      color: const Color(0xFF292929),
+      elevation: 8,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(6),
+        side: const BorderSide(color: Color(0xFF444444)),
+      ),
+      items: [
+        const PopupMenuItem<String>(
+          value: 'copy',
+          height: 36,
+          child: Row(
+            children: [
+              Text('📋 ', style: TextStyle(fontSize: 13)),
+              Text(
+                '현상 설정 복사 (변형 제외)',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem<String>(
+          value: 'paste',
+          enabled: hasCopiedSettings,
+          height: 36,
+          child: Row(
+            children: [
+              const Text('📥 ', style: TextStyle(fontSize: 13)),
+              Text(
+                '현상 설정 붙여넣기',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: hasCopiedSettings ? const Color(0xFFE8A838) : Colors.grey,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(height: 1),
+        const PopupMenuItem<String>(
+          value: 'remove',
+          height: 36,
+          child: Row(
+            children: [
+              Text('✕ ', style: TextStyle(fontSize: 13, color: Color(0xFFFF6B6B))),
+              Text(
+                '이 사진 닫기',
+                style: TextStyle(fontSize: 12, color: Color(0xFFFF6B6B)),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+
+    if (selected == 'copy') {
+      onCopySettings?.call(idx);
+    } else if (selected == 'paste') {
+      onPasteSettings?.call(idx);
+    } else if (selected == 'remove') {
+      onRemove(idx);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -66,8 +152,8 @@ class FilmstripWidget extends StatelessWidget {
                       items.isEmpty
                           ? '🎞️ 필름스트립 (0장 로드됨 — 클릭하여 사진 추가)'
                           : (collapsed
-                              ? '▲ 필름스트립 펼치기 (${items.length}장 로드됨)'
-                              : '▼ 필름스트립 접기 (${items.length}장 로드됨)'),
+                              ? '▲ 필름스트립 펼치기 (${items.length}장 로드됨 — 우클릭/길게눌러 복사/붙여넣기)'
+                              : '▼ 필름스트립 접기 (${items.length}장 로드됨 — 우클릭/길게눌러 복사/붙여넣기)'),
                       style: const TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.bold,
@@ -78,8 +164,8 @@ class FilmstripWidget extends StatelessWidget {
                   ),
                   const SizedBox(width: 8),
                   const Text(
-                    '단축키: Ctrl+O 열기 | B 전/후 비교 | G 격자',
-                    style: TextStyle(fontSize: 10, color: Color(0xFF777777)),
+                    '우클릭/길게누름: 설정 복사·붙여넣기 | Ctrl+O 열기',
+                    style: TextStyle(fontSize: 10, color: Color(0xFF888888)),
                   ),
                 ],
               ),
@@ -100,6 +186,10 @@ class FilmstripWidget extends StatelessWidget {
                   final isSelected = idx == currentIndex;
                   return GestureDetector(
                     onTap: () => onSelect(idx),
+                    onSecondaryTapDown: (details) =>
+                        _showContextMenu(context, details.globalPosition, idx),
+                    onLongPressStart: (details) =>
+                        _showContextMenu(context, details.globalPosition, idx),
                     child: Container(
                       width: 96,
                       margin: const EdgeInsets.only(right: 8),

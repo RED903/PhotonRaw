@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import '../models/pipeline_params.dart';
 import 'curve_lut.dart';
 import 'lens_profile_service.dart';
+import 'liquify_service.dart';
 
 /// 선형 RGB 32-bit float 이미지 (RGB 인터리브)
 class FloatImage {
@@ -491,6 +492,25 @@ FloatImage applyPipeline(FloatImage geo, PipelineParams p) {
   final w = geo.width;
   final h = geo.height;
   final buf = Float32List.fromList(geo.data);
+
+  if (p.liquifyEnabled) {
+    final combinedGrid = p.liquifyGrid.clone();
+    if (p.liquifyFaceDetected || !p.liquifyFaceParams.isNeutral) {
+      LiquifyService.applyFaceAwareToGrid(
+        grid: combinedGrid,
+        lm: p.liquifyLandmarks,
+        params: p.liquifyFaceParams,
+      );
+    }
+    if (!combinedGrid.isEmpty) {
+      LiquifyService.applyWarpToFloatBuffer(
+        buf: buf,
+        w: w,
+        h: h,
+        grid: combinedGrid,
+      );
+    }
+  }
 
   if (p.spotEnabled && p.spots.isNotEmpty) {
     _applySpots(buf, w, h, p.spots);

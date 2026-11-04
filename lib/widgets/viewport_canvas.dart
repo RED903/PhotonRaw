@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import '../models/pipeline_params.dart';
+import '../models/liquify_params.dart';
 
 /// SemiDarktable의 GLImageViewport 인터랙션 및 오버레이 1:1 이식
 /// - BMP 재인코딩 없이 GPU 텍스처(ui.Image)를 직접 CustomPainter로 렌더링하여 창 크기 조절 시 크래시/멈춤 원천 차단
@@ -44,6 +45,17 @@ class ViewportCanvas extends StatefulWidget {
   final ValueChanged<double> onHorizonAngleComputed;
   final void Function(double normX, double normY) onWbSamplePicked;
   final ValueChanged<List<Spot>> onSpotsChanged;
+  final bool liquifyEditMode;
+  final void Function(
+    double normX,
+    double normY,
+    double normDeltaX,
+    double normDeltaY,
+    double normRadius,
+    double pressure,
+  )? onLiquifyBrushStroke;
+  final VoidCallback? onLiquifyStrokeEnd;
+  final ValueChanged<FaceLandmarks>? onFaceLandmarksChanged;
 
   const ViewportCanvas({
     super.key,
@@ -64,6 +76,10 @@ class ViewportCanvas extends StatefulWidget {
     this.newRedEyeRadius = 0.025,
     this.newRedEyeStrength = 0.85,
     this.onRedEyesChanged,
+    this.liquifyEditMode = false,
+    this.onLiquifyBrushStroke,
+    this.onLiquifyStrokeEnd,
+    this.onFaceLandmarksChanged,
     required this.onOpenFileRequested,
     required this.onSplitPositionChanged,
     required this.onCropRectChanged,
@@ -96,6 +112,10 @@ class ViewportCanvasState extends State<ViewportCanvas> {
   final List<Offset> _activeStrokeNorm = [];
 
   int? _draggingRedEyeIndex;
+
+  bool _isLiquifyBrushing = false;
+  Offset? _lastLiquifyNorm;
+  String? _draggingFaceAnchor;
 
   bool _isMiddleMousePanning = false;
   Offset? _hoverLocalPos;
@@ -388,6 +408,7 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       _horizonEnd = null;
       return;
     }
+
     _isPinching = false;
 
     final imgRect = _computeImageRect(size);
@@ -489,6 +510,49 @@ class ViewportCanvasState extends State<ViewportCanvas> {
         widget.onRedEyesChanged!(next);
       }
       return;
+    }
+
+    // 4-B. 픽셀 유동화 (Liquify) 브러시 스트로크 및 얼굴 랜드마크 드래그 시작
+    if (widget.liquifyEditMode && widget.params.liquifyEnabled) {
+      final norm = _localToImageNorm(pos, imgRect);
+      if (norm != null) {
+        if (widget.params.liquifyTool == LiquifyToolType.faceAware && widget.params.liquifyShowGuide) {
+          final lm = widget.params.liquifyLandmarks;
+          final anchors = <String, Offset>{
+            'leftEye': Offset(lm.leftEyeX, lm.leftEyeY),
+            'rightEye': Offset(lm.rightEyeX, lm.rightEyeY),
+            'nose': Offset(lm.noseX, lm.noseY),
+            'mouth': Offset(lm.mouthX, lm.mouthY),
+            'chin': Offset(lm.chinX, lm.chinY),
+            'center': Offset(lm.centerX, lm.centerY),
+          };
+          for (final entry in anchors.entries) {
+            final pt = Offset(
+              imgRect.left + entry.value.dx * imgRect.width,
+              imgRect.top + entry.value.dy * imgRect.height,
+            );
+            if ((pos - pt).distance <= 22.0) {
+              _draggingFaceAnchor = entry.key;
+              return;
+            }
+          }
+        }
+
+        if (widget.params.liquifyTool != LiquifyToolType.faceAware) {
+          _isLiquifyBrushing = true;
+          _lastLiquifyNorm = norm;
+          final normR = (widget.params.liquifyBrushSize / maxDim).clamp(0.01, 0.4);
+          widget.onLiquifyBrushStroke?.call(
+            norm.dx,
+            norm.dy,
+            0.0,
+            0.0,
+            normR,
+            widget.params.liquifyBrushPressure,
+          );
+          return;
+        }
+      }
     }
 
     // 5. Before/After 분할선 드래그
@@ -650,6 +714,74 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       return;
     }
 
+    // 4-B. 픽셀 유동화 (Liquify) 브러시 또는 얼굴 랜드마크 드래그 처리
+    if (widget.liquifyEditMode && widget.params.liquifyEnabled) {
+      final norm = _localToImageNorm(pos, imgRect);
+      final maxDim = math.max(imgRect.width, imgRect.height);
+      if (norm != null) {
+        if (_draggingFaceAnchor != null && widget.onFaceLandmarksChanged != null) {
+          final lm = widget.params.liquifyLandmarks.clone();
+          switch (_draggingFaceAnchor) {
+            case 'leftEye':
+              lm.leftEyeX = norm.dx;
+              lm.leftEyeY = norm.dy;
+              break;
+            case 'rightEye':
+              lm.rightEyeX = norm.dx;
+              lm.rightEyeY = norm.dy;
+              break;
+            case 'nose':
+              lm.noseX = norm.dx;
+              lm.noseY = norm.dy;
+              break;
+            case 'mouth':
+              lm.mouthX = norm.dx;
+              lm.mouthY = norm.dy;
+              break;
+            case 'chin':
+              lm.chinX = norm.dx;
+              lm.chinY = norm.dy;
+              break;
+            case 'center':
+              final ddx = norm.dx - lm.centerX;
+              final ddy = norm.dy - lm.centerY;
+              lm.centerX = norm.dx;
+              lm.centerY = norm.dy;
+              lm.leftEyeX = (lm.leftEyeX + ddx).clamp(0.02, 0.98);
+              lm.leftEyeY = (lm.leftEyeY + ddy).clamp(0.02, 0.98);
+              lm.rightEyeX = (lm.rightEyeX + ddx).clamp(0.02, 0.98);
+              lm.rightEyeY = (lm.rightEyeY + ddy).clamp(0.02, 0.98);
+              lm.noseX = (lm.noseX + ddx).clamp(0.02, 0.98);
+              lm.noseY = (lm.noseY + ddy).clamp(0.02, 0.98);
+              lm.mouthX = (lm.mouthX + ddx).clamp(0.02, 0.98);
+              lm.mouthY = (lm.mouthY + ddy).clamp(0.02, 0.98);
+              lm.chinX = (lm.chinX + ddx).clamp(0.02, 0.98);
+              lm.chinY = (lm.chinY + ddy).clamp(0.02, 0.98);
+              break;
+          }
+          widget.onFaceLandmarksChanged!(lm);
+          return;
+        }
+
+        if (_isLiquifyBrushing && _lastLiquifyNorm != null) {
+          final deltaX = norm.dx - _lastLiquifyNorm!.dx;
+          final deltaY = norm.dy - _lastLiquifyNorm!.dy;
+          _lastLiquifyNorm = norm;
+          final normR = (widget.params.liquifyBrushSize / maxDim).clamp(0.01, 0.4);
+          widget.onLiquifyBrushStroke?.call(
+            norm.dx,
+            norm.dy,
+            deltaX,
+            deltaY,
+            normR,
+            widget.params.liquifyBrushPressure,
+          );
+          return;
+        }
+      }
+      return;
+    }
+
     // 5. Before/After 분할선 이동
     if (_draggingSplit) {
       final norm = _localToImageNorm(pos, imgRect);
@@ -727,6 +859,14 @@ class ViewportCanvasState extends State<ViewportCanvas> {
       widget.onSelectedSpotChanged?.call(spots.length - 1);
       widget.onSpotsChanged(spots);
     }
+
+
+    if (_isLiquifyBrushing) {
+      _isLiquifyBrushing = false;
+      _lastLiquifyNorm = null;
+      widget.onLiquifyStrokeEnd?.call();
+    }
+    _draggingFaceAnchor = null;
 
     _isPinching = false;
     _draggingSplit = false;
@@ -900,6 +1040,7 @@ class ViewportCanvasState extends State<ViewportCanvas> {
                       newRedEyeRadius: widget.newRedEyeRadius,
                       hoverLocalPos: _hoverLocalPos,
                       showRadiusGuide: _showRadiusGuide,
+                      liquifyEditMode: widget.liquifyEditMode,
                     ),
                   ),
                 ),
@@ -929,6 +1070,7 @@ class _ViewportPainter extends CustomPainter {
   final double newRedEyeRadius;
   final Offset? hoverLocalPos;
   final bool showRadiusGuide;
+  final bool liquifyEditMode;
 
   _ViewportPainter({
     required this.processedImage,
@@ -947,6 +1089,7 @@ class _ViewportPainter extends CustomPainter {
     required this.newRedEyeRadius,
     required this.hoverLocalPos,
     required this.showRadiusGuide,
+    this.liquifyEditMode = false,
   });
 
   @override
@@ -1284,7 +1427,55 @@ class _ViewportPainter extends CustomPainter {
             ..strokeWidth = 1.6
             ..style = PaintingStyle.stroke,
         );
+      }
+
+    // 8. 픽셀 유동화 (Liquify) 브러시 원 및 얼굴 인식 가이드 오버레이
+    if (liquifyEditMode && params.liquifyEnabled) {
+      if (params.liquifyTool == LiquifyToolType.faceAware && params.liquifyShowGuide) {
+        final lm = params.liquifyLandmarks;
+        final faceCenter = Offset(
+          imgRect.left + lm.centerX * imgRect.width,
+          imgRect.top + lm.centerY * imgRect.height,
+        );
+        final faceW = lm.width * imgRect.width;
+        final faceH = lm.height * imgRect.height;
+        final faceRect = Rect.fromCenter(center: faceCenter, width: faceW, height: faceH);
+
+        canvas.drawOval(
+          faceRect,
+          Paint()
+            ..color = const Color(0x99E8A838)
+            ..strokeWidth = 1.6
+            ..style = PaintingStyle.stroke,
+        );
+
+        final anchors = [
+          Offset(imgRect.left + lm.leftEyeX * imgRect.width, imgRect.top + lm.leftEyeY * imgRect.height),
+          Offset(imgRect.left + lm.rightEyeX * imgRect.width, imgRect.top + lm.rightEyeY * imgRect.height),
+          Offset(imgRect.left + lm.noseX * imgRect.width, imgRect.top + lm.noseY * imgRect.height),
+          Offset(imgRect.left + lm.mouthX * imgRect.width, imgRect.top + lm.mouthY * imgRect.height),
+          Offset(imgRect.left + lm.chinX * imgRect.width, imgRect.top + lm.chinY * imgRect.height),
+        ];
+        for (final pt in anchors) {
+          canvas.drawCircle(pt, 5.5, Paint()..color = const Color(0xFFE8A838));
+          canvas.drawCircle(pt, 5.5, Paint()..color = Colors.black..style = PaintingStyle.stroke..strokeWidth = 1.0);
+        }
+      } else if (params.liquifyTool != LiquifyToolType.faceAware) {
+        final previewCenter = hoverLocalPos ?? imgRect.center;
+        if (imgRect.contains(previewCenter)) {
+          final previewR = math.max(4.0, (params.liquifyBrushSize / maxDim) * maxDim);
+          canvas.drawCircle(previewCenter, previewR, Paint()..color = const Color(0x2200E5FF));
+          canvas.drawCircle(
+            previewCenter,
+            previewR,
+            Paint()
+              ..color = const Color(0xEE00E5FF)
+              ..strokeWidth = 1.6
+              ..style = PaintingStyle.stroke,
+          );
+        }
       }
+    }
     }
   }
 

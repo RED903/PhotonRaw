@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'liquify_params.dart';
 
 /// 스팟 리터칭 한 점 또는 자유 곡선 브러시 스트로크 (모두 0~1 정규화 좌표)
 class Spot {
@@ -265,6 +266,17 @@ class PipelineParams {
   bool redEyeEnabled = false;
   List<RedEyeSpot> redEyes = [];
 
+  // 픽셀 유동화 (Liquify & Face-Aware)
+  bool liquifyEnabled = false;
+  LiquifyToolType liquifyTool = LiquifyToolType.warp;
+  double liquifyBrushSize = 50.0;
+  double liquifyBrushPressure = 0.5;
+  bool liquifyShowGuide = true;
+  bool liquifyFaceDetected = false;
+  FaceLandmarks liquifyLandmarks = FaceLandmarks();
+  FaceAwareParams liquifyFaceParams = FaceAwareParams();
+  LiquifyDisplacementGrid liquifyGrid = LiquifyDisplacementGrid();
+
   // 뷰
   bool splitViewEnabled = false;
   double splitPosition = 0.5;
@@ -272,6 +284,28 @@ class PipelineParams {
   PipelineParams();
 
   PipelineParams clone() => PipelineParams.fromMap(toMap());
+
+  /// 변형 세팅(회전, 플립, 각도, 크롭 등 기하학)을 제외한 현상 설정 맵 복사
+  Map<String, dynamic> toDevelopmentMap({bool excludeTransform = true}) {
+    final m = toMap();
+    if (excludeTransform) {
+      m.remove('rotate_90');
+      m.remove('flip_h');
+      m.remove('flip_v');
+      m.remove('angle');
+      m.remove('crop_enabled');
+      m.remove('crop_rect');
+      m.remove('split_view_enabled');
+      m.remove('split_position');
+    }
+    return m;
+  }
+
+  /// 다른 PipelineParams에서 변형 세팅을 제외한 현상 설정만 덮어쓰기
+  void copyDevelopmentFrom(PipelineParams source, {bool excludeTransform = true}) {
+    final m = source.toDevelopmentMap(excludeTransform: excludeTransform);
+    applyMap(m);
+  }
 
   Map<String, dynamic> toMap() => {
         'rotate_90': rotate90,
@@ -386,6 +420,16 @@ class PipelineParams {
         'spots': [for (final s in spots) s.toMap()],
         'red_eye_enabled': redEyeEnabled,
         'red_eyes': [for (final re in redEyes) re.toMap()],
+        'liquify_enabled': liquifyEnabled,
+        'liquify_tool': liquifyTool.name,
+        'liquify_brush_size': liquifyBrushSize,
+        'liquify_brush_pressure': liquifyBrushPressure,
+        'liquify_show_guide': liquifyShowGuide,
+        'liquify_face_detected': liquifyFaceDetected,
+        'liquify_landmarks': liquifyLandmarks.toMap(),
+        'liquify_face_params': liquifyFaceParams.toMap(),
+        'liquify_dx': liquifyGrid.toDxList(),
+        'liquify_dy': liquifyGrid.toDyList(),
         'split_view_enabled': splitViewEnabled,
         'split_position': splitPosition,
       };
@@ -552,6 +596,35 @@ class PipelineParams {
         for (final re in m['red_eyes'] as List)
           if (re is Map) RedEyeSpot.fromMap(re)
       ];
+    }
+    if (m.containsKey('liquify_enabled')) {
+      liquifyEnabled = _b(m['liquify_enabled'], liquifyEnabled);
+    }
+    if (m.containsKey('liquify_tool') && m['liquify_tool'] is String) {
+      try {
+        liquifyTool = LiquifyToolType.values.byName(m['liquify_tool']);
+      } catch (_) {}
+    }
+    if (m.containsKey('liquify_brush_size')) {
+      liquifyBrushSize = _d(m['liquify_brush_size'], liquifyBrushSize);
+    }
+    if (m.containsKey('liquify_brush_pressure')) {
+      liquifyBrushPressure = _d(m['liquify_brush_pressure'], liquifyBrushPressure);
+    }
+    if (m.containsKey('liquify_show_guide')) {
+      liquifyShowGuide = _b(m['liquify_show_guide'], liquifyShowGuide);
+    }
+    if (m.containsKey('liquify_face_detected')) {
+      liquifyFaceDetected = _b(m['liquify_face_detected'], liquifyFaceDetected);
+    }
+    if (m['liquify_landmarks'] is Map) {
+      liquifyLandmarks = FaceLandmarks.fromMap(m['liquify_landmarks']);
+    }
+    if (m['liquify_face_params'] is Map) {
+      liquifyFaceParams = FaceAwareParams.fromMap(m['liquify_face_params']);
+    }
+    if (m['liquify_dx'] is List && m['liquify_dy'] is List) {
+      liquifyGrid = LiquifyDisplacementGrid.fromLists(m['liquify_dx'], m['liquify_dy']);
     }
     if (m.containsKey('split_view_enabled')) splitViewEnabled = _b(m['split_view_enabled'], splitViewEnabled);
     if (m.containsKey('split_position')) splitPosition = _d(m['split_position'], splitPosition);

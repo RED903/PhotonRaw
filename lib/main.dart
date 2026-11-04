@@ -10,13 +10,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 
+import 'models/liquify_params.dart';
 import 'models/pipeline_params.dart';
+import 'services/liquify_service.dart';
 import 'services/pipeline_core.dart';
 import 'services/lens_profile_service.dart';
 import 'services/preset_service.dart';
 import 'services/raw_decoder.dart';
 import 'services/scopes.dart';
 import 'widgets/calibration_widget.dart';
+import 'widgets/liquify_widget.dart';
 import 'widgets/color_equalizer_widget.dart';
 import 'widgets/color_grading_widget.dart';
 import 'widgets/control_slider.dart';
@@ -49,7 +52,7 @@ class PhotonRawApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PhotonRaw v1.0.14 — Pro RAW & Photo Darkroom',
+      title: 'PhotonRaw v1.0.15 — Pro RAW & Photo Darkroom',
       debugShowCheckedModeBanner: false,
       // Windows flutter_windows.dll(0x3c1ca) AccessibilityBridge AXTree 크래시 원천 차단을 위해 Semantics 트리 비활성화
       builder: (context, child) => ExcludeSemantics(
@@ -292,6 +295,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
 
   final List<LoadedPhotoState> _photos = [];
   int _currentIndex = -1;
+  Map<String, dynamic>? _copiedDevelopmentMap;
 
   // 현재 화면에 표시할 GPU 텍스처 및 스코프 데이터
   ui.Image? _processedUiImage;
@@ -1336,6 +1340,9 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                             _triggerRender(fast: false);
                           },
                           onAddFiles: _pickAndLoadFiles,
+                          onCopySettings: _copyDevelopmentSettings,
+                          onPasteSettings: _pasteDevelopmentSettings,
+                          hasCopiedSettings: _copiedDevelopmentMap != null,
                         ),
                         _buildBottomStatusBar(),
                       ],
@@ -1346,6 +1353,48 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  void _copyDevelopmentSettings(int idx) {
+    if (idx < 0 || idx >= _photos.length) return;
+    final photo = _photos[idx];
+    _copiedDevelopmentMap = photo.params.toDevelopmentMap(excludeTransform: true);
+    setState(() {
+      _statusMessage = '📋 ""의 현상 설정을 복사했습니다 (변형 세팅 제외).';
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('📋 ""의 현상 설정을 복사했습니다 (변형 세팅 제외).'),
+        duration: const Duration(seconds: 2),
+        backgroundColor: const Color(0xFF2C2C2C),
+      ),
+    );
+  }
+
+  void _pasteDevelopmentSettings(int idx) {
+    if (_copiedDevelopmentMap == null || idx < 0 || idx >= _photos.length) return;
+    final photo = _photos[idx];
+    if (idx == _currentIndex) {
+      _pushUndoSnapshot();
+    } else {
+      photo.undoStack.add(photo.params.toMap());
+      photo.redoStack.clear();
+    }
+    photo.params.applyMap(_copiedDevelopmentMap!);
+
+    setState(() {
+      _statusMessage = '📥 ""에 현상 설정을 붙여넣었습니다 (변형 세팅 제외).';
+    });
+    if (idx == _currentIndex) {
+      _triggerRender(fast: false);
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('📥 ""에 현상 설정을 붙여넣었습니다 (변형 세팅 제외).'),
+        duration: const Duration(seconds: 2),
+        backgroundColor: const Color(0xFF2C2C2C),
       ),
     );
   }
@@ -1367,7 +1416,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.14',
+                '⚡ PhotonRaw v1.0.15',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,
@@ -1588,6 +1637,27 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             _triggerRender(fast: false);
           },
           onWbSamplePicked: _handleWbSamplePicked,
+          liquifyEditMode: _params.liquifyEnabled && _activeCategory == 'geometry',
+          onLiquifyBrushStroke: (nx, ny, dx, dy, r, pressure) {
+            if (_currentPhoto == null) return;
+            _params.liquifyGrid.applyBrush(
+              tool: _params.liquifyTool,
+              normX: nx,
+              normY: ny,
+              normRadius: r,
+              normDeltaX: dx,
+              normDeltaY: dy,
+              pressure: pressure,
+            );
+            _triggerRender(fast: true);
+          },
+          onLiquifyStrokeEnd: () {
+            _pushUndoSnapshot();
+            _triggerRender(fast: false);
+          },
+          onFaceLandmarksChanged: (lm) {
+            _updateParams((p) => p.liquifyLandmarks = lm, fast: true);
+          },
           onSpotsChanged: (spots) {
             // 스팟 드래그 중 매 프레임 스냅샷이 쌓이지 않도록 400ms 이내 연속 변경은 하나로 묶음
             final nowT = DateTime.now();
@@ -2517,6 +2587,76 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
               onAutoTurnOn: () => p.lensCorrectionEnabled = true,
               onChanged: (v) => _updateParams((params) => params.lensManualTcaB = v),
               onChangeEnd: () => _triggerRender(fast: false),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // 1-E. 픽셀 유동화 (Liquify & Face-Aware) — 포토샵 CC 2018 REA 역공학 기반
+    if (_isModuleVisible(
+      title: '픽셀 유동화 (Liquify & Face-Aware)',
+      category: 'geometry',
+      enabled: p.liquifyEnabled,
+    )) {
+      cards.add(
+        _buildCard(
+          title: '💧 픽셀 유동화 (Liquify & Face-Aware)',
+          category: 'geometry',
+          enabled: p.liquifyEnabled,
+          initiallyExpanded: false,
+          onToggleEnabled: (v) {
+            _updateParams(
+              (params) => params.liquifyEnabled = v,
+              recordUndo: true,
+              fast: false,
+            );
+          },
+          onReset: () {
+            _updateParams(
+              (params) {
+                params.liquifyEnabled = false;
+                params.liquifyGrid.clear();
+                params.liquifyFaceParams.reset();
+              },
+              recordUndo: true,
+              fast: false,
+            );
+          },
+          children: [
+            LiquifyWidget(
+              params: p,
+              onParamsChanged: (fn) {
+                _pushUndoSnapshot();
+                _updateParams((params) {
+                  params.liquifyEnabled = true;
+                  fn(params);
+                }, fast: false);
+              },
+              onDetectFace: () {
+                if (_currentPhoto == null) return;
+                final (detected, lm) = LiquifyService.detectFace(_currentPhoto!.fastProxy);
+                _pushUndoSnapshot();
+                _updateParams((params) {
+                  params.liquifyEnabled = true;
+                  params.liquifyFaceDetected = detected;
+                  params.liquifyLandmarks = lm;
+                  params.liquifyTool = LiquifyToolType.faceAware;
+                }, fast: false);
+                _showSnack(
+                  detected
+                      ? '✨ 얼굴 윤곽 및 눈/코/입 특징점을 자동 감지했습니다.'
+                      : 'ℹ️ 기본 얼굴 가이드를 배치했습니다. 화면에서 드래그하여 맞출 수 있습니다.',
+                );
+              },
+              onResetLiquify: () {
+                _pushUndoSnapshot();
+                _updateParams((params) {
+                  params.liquifyGrid.clear();
+                  params.liquifyFaceParams.reset();
+                }, fast: false);
+                _showSnack('픽셀 유동화 및 얼굴 보정 수치가 초기화되었습니다.');
+              },
             ),
           ],
         ),

@@ -3,7 +3,9 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:photon_raw/main.dart';
+import 'package:photon_raw/models/liquify_params.dart';
 import 'package:photon_raw/models/pipeline_params.dart';
+import 'package:photon_raw/services/liquify_service.dart';
 import 'package:photon_raw/services/curve_lut.dart';
 import 'package:photon_raw/services/lens_profile_service.dart';
 import 'package:photon_raw/services/pipeline_core.dart';
@@ -321,7 +323,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1440, 900));
     await tester.pumpWidget(const PhotonRawApp());
-    expect(find.text('⚡ PhotonRaw v1.0.14'), findsOneWidget);
+    expect(find.text('⚡ PhotonRaw v1.0.15'), findsOneWidget);
     expect(find.text('사진 또는 RAW 파일을 불러오세요'), findsOneWidget);
 
     // 0. 상단 바에서 '📋 복사', '📌 붙여넣기', '📌 전체 적용' 및 외부 프리셋 드롭다운이 제거되고 '⚙️ 프리셋 관리'와 '🌐 격자 표시'가 상단에 있는지 검증
@@ -606,5 +608,100 @@ void main() {
     final restored = PipelineParams.fromMap(p.toMap());
     expect(restored.lensCorrectionEnabled, isTrue);
     expect(restored.lensProfileModel, equals('FE 24-70mm F2.8 GM (SEL2470GM)'));
+  });
+
+  test('필름스트립 변형 세팅 제외 현상 설정 복사/붙여넣기 검증', () {
+    final src = PipelineParams()
+      ..rotate90 = 90
+      ..flipH = true
+      ..angle = 12.5
+      ..cropEnabled = true
+      ..cropRect = [0.1, 0.2, 0.5, 0.6]
+      ..exposureEnabled = true
+      ..expEv = 1.25
+      ..wbEnabled = true
+      ..wbTemperature = 7500.0
+      ..colorGradingEnabled = true
+      ..cgMidtonesHue = 180.0;
+
+    final dst = PipelineParams()
+      ..rotate90 = 270
+      ..flipH = false
+      ..angle = -5.0
+      ..cropEnabled = false
+      ..cropRect = [0.0, 0.0, 1.0, 1.0]
+      ..expEv = 0.0;
+
+    // 변형 제외 복사 적용
+    dst.copyDevelopmentFrom(src, excludeTransform: true);
+
+    // 1. 변형 세팅(기하학)은 덮어씌워지지 않고 대상 이미지 고유값 유지
+    expect(dst.rotate90, equals(270));
+    expect(dst.flipH, isFalse);
+    expect(dst.angle, equals(-5.0));
+    expect(dst.cropEnabled, isFalse);
+    expect(dst.cropRect, equals([0.0, 0.0, 1.0, 1.0]));
+
+    // 2. 노출/화이트밸런스/컬러그레이딩 등 현상 파라미터는 완벽 복사됨
+    expect(dst.exposureEnabled, isTrue);
+    expect(dst.expEv, equals(1.25));
+    expect(dst.wbEnabled, isTrue);
+    expect(dst.wbTemperature, equals(7500.0));
+    expect(dst.colorGradingEnabled, isTrue);
+    expect(dst.cgMidtonesHue, equals(180.0));
+  });
+
+  test('포토샵 CC 2018 REA 역공학 기반 픽셀 유동화 (Liquify & Face-Aware) 파이프라인 검증', () {
+    const w = 64, h = 64;
+    // 테스트 이미지: 중앙에 흰색 사각형 패턴
+    final rgb = Uint8List(w * h * 3);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final idx = (y * w + x) * 3;
+        final isCenter = (x >= 24 && x <= 40 && y >= 24 && y <= 40);
+        final val = isCenter ? 255 : 30;
+        rgb[idx] = val;
+        rgb[idx + 1] = val;
+        rgb[idx + 2] = val;
+      }
+    }
+    final proxy = ProxyImage(w, h, rgb);
+
+    // 1. 유동화 브러시 (Warp) 적용 검증
+    final p = PipelineParams()
+      ..liquifyEnabled = true
+      ..liquifyTool = LiquifyToolType.warp;
+
+    // 중앙 사각형을 오른쪽으로 밀어내는 워프 브러시 적용
+    p.liquifyGrid.applyBrush(
+      tool: LiquifyToolType.warp,
+      normX: 0.5,
+      normY: 0.5,
+      normRadius: 0.25,
+      normDeltaX: 0.12,
+      normDeltaY: 0.0,
+      pressure: 0.8,
+    );
+    expect(p.liquifyGrid.isEmpty, isFalse);
+
+    // 렌더 실행
+    final warpedOut = renderPreview(proxy, p);
+    expect(warpedOut.rgba.length, w * h * 4);
+
+    // 워프 적용으로 인해 오른쪽 경계 바로 바깥(x=42, 원래는 어두운 30) 픽셀로 중앙 밝은 픽셀이 밀려와 밝기가 증가해야 함
+    final rightPxIdx = (32 * w + 42) * 4;
+    expect(warpedOut.rgba[rightPxIdx], greaterThan(30));
+
+    // 2. 얼굴 인식 (Face-Aware) 파라미터 및 직렬화 검증
+    p.liquifyFaceParams.eyeSizeLeft = 50.0;
+    p.liquifyFaceParams.smile = 30.0;
+    p.liquifyFaceParams.jawline = -25.0;
+    expect(p.liquifyFaceParams.isNeutral, isFalse);
+
+    final restored = PipelineParams.fromMap(p.toMap());
+    expect(restored.liquifyEnabled, isTrue);
+    expect(restored.liquifyFaceParams.eyeSizeLeft, equals(50.0));
+    expect(restored.liquifyFaceParams.smile, equals(30.0));
+    expect(restored.liquifyFaceParams.jawline, equals(-25.0));
   });
 }
