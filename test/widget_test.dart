@@ -11,6 +11,7 @@ import 'package:photon_raw/services/lens_profile_service.dart';
 import 'package:photon_raw/services/pipeline_core.dart';
 import 'package:photon_raw/services/raw_decoder.dart';
 import 'package:photon_raw/services/scopes.dart';
+import 'package:photon_raw/services/xmp_service.dart';
 import 'package:photon_raw/widgets/calibration_widget.dart';
 import 'package:photon_raw/widgets/color_equalizer_widget.dart';
 import 'package:photon_raw/widgets/color_grading_widget.dart';
@@ -323,7 +324,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1440, 900));
     await tester.pumpWidget(const PhotonRawApp());
-    expect(find.text('⚡ PhotonRaw v1.0.15'), findsOneWidget);
+    expect(find.text('⚡ PhotonRaw v1.0.16'), findsOneWidget);
     expect(find.text('사진 또는 RAW 파일을 불러오세요'), findsOneWidget);
 
     // 0. 상단 바에서 '📋 복사', '📌 붙여넣기', '📌 전체 적용' 및 외부 프리셋 드롭다운이 제거되고 '⚙️ 프리셋 관리'와 '🌐 격자 표시'가 상단에 있는지 검증
@@ -703,5 +704,53 @@ void main() {
     expect(restored.liquifyFaceParams.eyeSizeLeft, equals(50.0));
     expect(restored.liquifyFaceParams.smile, equals(30.0));
     expect(restored.liquifyFaceParams.jawline, equals(-25.0));
+  });
+
+  test('다크테이블·라이트룸 XMP 사이드카 별점 및 메타데이터 파싱/저장, LightCraft 렌즈 DB 매칭 검증', () async {
+    // 1. 임시 XMP 사이드카 파일 작성 및 로드 테스트
+    final tempDir = Directory.systemTemp.createTempSync('xmp_test_');
+    final dummyPhoto = File('${tempDir.path}/7M401154.ARW')..writeAsBytesSync([0, 1, 2]);
+    final xmpFile = File('${tempDir.path}/7M401154.xmp');
+    xmpFile.writeAsStringSync('''
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+    xmlns:exifEX="http://cipa.jp/exif/1.0/"
+    xmlns:aux="http://ns.adobe.com/exif/1.0/aux/"
+   xmp:Rating="2"
+   tiff:Model="ILCE-7M4"
+   exifEX:LensModel="E 28-75mm F2.8-2.8"
+   aux:Lens="E 28-75mm F2.8-2.8">
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+''');
+
+    final xmpData = await XmpService.loadXmp(dummyPhoto.path);
+    expect(xmpData, isNotNull);
+    expect(xmpData!.rating, equals(2));
+    expect(xmpData.lensModel, equals('E 28-75mm F2.8-2.8'));
+    expect(xmpData.cameraModel, equals('ILCE-7M4'));
+
+    // 2. 별점 수정 및 XMP 저장 검증
+    final saveOk = await XmpService.saveRating(photoPath: dummyPhoto.path, rating: 4);
+    expect(saveOk, isTrue);
+    final reloaded = await XmpService.loadXmp(dummyPhoto.path);
+    expect(reloaded!.rating, equals(4));
+
+    // 3. LightCraft / 내장 렌즈 DB에서 'E 28-75mm F2.8-2.8' 매칭 검증
+    final matchedLens = LensProfileService.findBestProfile(
+      cameraName: 'ILCE-7M4',
+      lensModel: 'E 28-75mm F2.8-2.8',
+    );
+    expect(matchedLens, isNotNull);
+    // 24-70이 아니라 정확히 28-75 Tamron 렌즈로 매칭되어야 함
+    expect(matchedLens!.model.contains('28-75mm'), isTrue);
+    expect(matchedLens.maker.toLowerCase(), contains('tamron'));
+
+    // 임시 디렉터리 정리
+    tempDir.deleteSync(recursive: true);
   });
 }

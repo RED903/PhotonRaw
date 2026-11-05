@@ -18,6 +18,7 @@ import 'services/lens_profile_service.dart';
 import 'services/preset_service.dart';
 import 'services/raw_decoder.dart';
 import 'services/scopes.dart';
+import 'services/xmp_service.dart';
 import 'widgets/calibration_widget.dart';
 import 'widgets/liquify_widget.dart';
 import 'widgets/color_equalizer_widget.dart';
@@ -80,6 +81,7 @@ class LoadedPhotoState {
   final ProxyImage fastProxy; // 슬라이더 드래그 중 즉각 반응용 (560px)
   final ProxyImage qualityProxy; // 조작 완료 후 고해상도 프리뷰용 (1150px)
   PipelineParams params;
+  int rating; // XMP 연동 별점 (0~5)
   final List<Map<String, dynamic>> undoStack = [];
   final List<Map<String, dynamic>> redoStack = [];
   ui.Image? thumbnailImage;
@@ -91,6 +93,7 @@ class LoadedPhotoState {
     required this.fastProxy,
     required this.qualityProxy,
     required this.params,
+    this.rating = 0,
     this.thumbnailImage,
   });
 }
@@ -496,6 +499,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
           fastProxy: bundle.fastProxy,
           qualityProxy: bundle.qualityProxy,
           params: initParams,
+          rating: bundle.decoded.rating,
           thumbnailImage: thumbImg,
         );
 
@@ -1246,6 +1250,31 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         const SingleActivator(LogicalKeyboardKey.keyG): () {
           setState(() => _showGrid = !_showGrid);
         },
+        // 별점 단축키 (0~5번 키: Lightroom / darktable과 100% 동일한 워크플로우)
+        const SingleActivator(LogicalKeyboardKey.digit0): () =>
+            _setPhotoRating(_currentIndex, 0),
+        const SingleActivator(LogicalKeyboardKey.digit1): () =>
+            _setPhotoRating(_currentIndex, 1),
+        const SingleActivator(LogicalKeyboardKey.digit2): () =>
+            _setPhotoRating(_currentIndex, 2),
+        const SingleActivator(LogicalKeyboardKey.digit3): () =>
+            _setPhotoRating(_currentIndex, 3),
+        const SingleActivator(LogicalKeyboardKey.digit4): () =>
+            _setPhotoRating(_currentIndex, 4),
+        const SingleActivator(LogicalKeyboardKey.digit5): () =>
+            _setPhotoRating(_currentIndex, 5),
+        const SingleActivator(LogicalKeyboardKey.numpad0): () =>
+            _setPhotoRating(_currentIndex, 0),
+        const SingleActivator(LogicalKeyboardKey.numpad1): () =>
+            _setPhotoRating(_currentIndex, 1),
+        const SingleActivator(LogicalKeyboardKey.numpad2): () =>
+            _setPhotoRating(_currentIndex, 2),
+        const SingleActivator(LogicalKeyboardKey.numpad3): () =>
+            _setPhotoRating(_currentIndex, 3),
+        const SingleActivator(LogicalKeyboardKey.numpad4): () =>
+            _setPhotoRating(_currentIndex, 4),
+        const SingleActivator(LogicalKeyboardKey.numpad5): () =>
+            _setPhotoRating(_currentIndex, 5),
       },
       child: Focus(
         // 시작 시 자동 포커스를 받아야 Ctrl+Z / Ctrl+Y 단축키가 즉시 동작함
@@ -1308,6 +1337,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                                   filePath: p.filePath,
                                   fileName: p.fileName,
                                   thumbnail: p.thumbnailImage,
+                                  rating: p.rating,
                                 ),
                               )
                               .toList(),
@@ -1342,6 +1372,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
                           onAddFiles: _pickAndLoadFiles,
                           onCopySettings: _copyDevelopmentSettings,
                           onPasteSettings: _pasteDevelopmentSettings,
+                          onSetRating: _setPhotoRating,
                           hasCopiedSettings: _copiedDevelopmentMap != null,
                         ),
                         _buildBottomStatusBar(),
@@ -1355,6 +1386,29 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
         ),
       ),
     );
+  }
+
+  Future<void> _setPhotoRating(int idx, int newRating) async {
+    if (idx < 0 || idx >= _photos.length) return;
+    final photo = _photos[idx];
+    final validRating = newRating.clamp(0, 5);
+    setState(() {
+      photo.rating = validRating;
+    });
+    try {
+      await XmpService.saveRating(
+        photoPath: photo.filePath,
+        rating: validRating,
+      );
+      if (mounted) {
+        final starStr = validRating > 0 ? '★ $validRating' : '별점 없음';
+        _showSnack('${photo.fileName}: $starStr 저장 완료 (.xmp 사이드카 연동)');
+      }
+    } catch (e) {
+      if (mounted) {
+        _showSnack('별점 저장 실패: $e');
+      }
+    }
   }
 
   void _copyDevelopmentSettings(int idx) {
@@ -1416,7 +1470,7 @@ class _DarkroomScreenState extends State<DarkroomScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 10),
               child: Text(
-                '⚡ PhotonRaw v1.0.15',
+                '⚡ PhotonRaw v1.0.16',
                 style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.bold,

@@ -33,6 +33,7 @@ class LensProfile {
   final double tcaBr;
   final double tcaVb;
   final double tcaBb;
+  final List<String> aliases;
 
   const LensProfile({
     required this.maker,
@@ -51,6 +52,7 @@ class LensProfile {
     this.tcaBr = 0.0,
     this.tcaVb = 1.0,
     this.tcaBb = 0.0,
+    this.aliases = const [],
   });
 
   /// 렌즈 왜곡 역변환 (왜곡된 타겟 (xd, yd)로부터 원본 (xu, yu)의 정규화 반경 배율 계산)
@@ -121,24 +123,40 @@ class LensProfileService {
     required String lensModel,
   }) {
     ensureInitialized();
-    if (lensModel.trim().isNotEmpty) {
-      final clean = lensModel.toLowerCase().trim();
+    final cleanLens = lensModel.toLowerCase().replaceAll(RegExp(r'[\s\-_\/]+'), ' ').trim();
+    if (cleanLens.isNotEmpty) {
+      // 1. 모델명 및 별칭(Aliases) 대조
       for (final p in _profiles) {
-        if (clean.contains(p.model.toLowerCase()) || p.model.toLowerCase().contains(clean)) {
+        final pModel = p.model.toLowerCase().replaceAll(RegExp(r'[\s\-_\/]+'), ' ').trim();
+        if (pModel == cleanLens || cleanLens.contains(pModel) || pModel.contains(cleanLens)) {
           return p;
+        }
+        for (final alias in p.aliases) {
+          final aClean = alias.toLowerCase().replaceAll(RegExp(r'[\s\-_\/]+'), ' ').trim();
+          if (aClean == cleanLens || cleanLens.contains(aClean) || aClean.contains(cleanLens)) {
+            return p;
+          }
+        }
+      }
+
+      // 2. "28-75", "16-35", "50mm" 등 초점거리 숫자 패턴 매칭
+      final focalMatch = RegExp(r'\b\d{1,3}(?:\s*-\s*\d{1,3})?\s*(?:mm)?\b').firstMatch(cleanLens)?.group(0);
+      if (focalMatch != null && focalMatch.trim().length >= 2) {
+        final fClean = focalMatch.replaceAll(' ', '');
+        for (final p in _profiles) {
+          final pClean = p.model.toLowerCase().replaceAll(' ', '');
+          if (pClean.contains(fClean) || p.aliases.any((a) => a.toLowerCase().replaceAll(' ', '').contains(fClean))) {
+            return p;
+          }
         }
       }
     }
 
-    if (cameraName.trim().isNotEmpty) {
-      final camLower = cameraName.toLowerCase();
-      for (final p in _profiles) {
-        if (camLower.contains(p.maker.toLowerCase())) {
-          return p;
-        }
-      }
-    }
-    return _profiles.firstWhere((p) => p.model == '표준 범용 (Standard Generic)', orElse: () => _profiles.first);
+    // 렌즈 모델을 명확히 식별할 수 없을 때는 엉뚱한 렌즈(24-70)로 오인식하지 않고 안전하게 표준 범용 반환
+    return _profiles.firstWhere(
+      (p) => p.model == '표준 범용 (Standard Generic)',
+      orElse: () => _profiles.first,
+    );
   }
 
   static void _registerBuiltinProfiles() {
@@ -350,13 +368,21 @@ class LensProfileService {
         mount: 'Sony E / Nikon Z',
         cropFactor: 1.0,
         distModel: 'ptlens',
-        distA: 0.015,
-        distB: -0.045,
-        distC: 0.010,
-        vigK1: -0.84,
-        vigK2: 0.42,
-        tcaVr: 1.00040,
-        tcaVb: 0.99970,
+        distA: 0.02351,
+        distB: -0.08149,
+        distC: 0.06775,
+        vigK1: -1.6788,
+        vigK2: 1.2384,
+        vigK3: -0.4099,
+        tcaVr: 1.00032,
+        tcaVb: 1.00003,
+        aliases: [
+          'E 28-75mm F2.8-2.8',
+          'Tamron E 28-75mm F2.8-2.8',
+          'Tamron 28-75mm F2.8 Di III VXD G2 (A063)',
+          'Tamron E 28-75mm F/2.8 Di III VXD G2 A063Z',
+          'A063',
+        ],
       ),
 
       // Fujifilm X
@@ -431,85 +457,91 @@ class LensProfileService {
 
   static void _tryLoadDarktableLensfun() {
     try {
+      final appData = Platform.environment['APPDATA'] ?? '';
       final candidates = [
+        if (appData.isNotEmpty) '$appData\\LightCraft\\lensfun',
+        r'C:\Users\red00\AppData\Roaming\LightCraft\lensfun',
+        r'assets\lensfun',
         r'C:\Program Files\darktable\share\lensfun\version_1',
         r'C:\Program Files (x86)\darktable\share\lensfun\version_1',
         r'C:\Program Files\ART\share\lensfun\version_1',
       ];
-      Directory? dbDir;
+
       for (final p in candidates) {
-        final d = Directory(p);
-        if (d.existsSync()) {
-          dbDir = d;
-          break;
+        final dbDir = Directory(p);
+        if (!dbDir.existsSync()) continue;
+
+        final xmlFiles = dbDir.listSync().whereType<File>().where((f) => f.path.endsWith('.xml'));
+        for (final f in xmlFiles) {
+          try {
+            final content = f.readAsStringSync();
+            final doc = XmlDocument.parse(content);
+            for (final lensElem in doc.findAllElements('lens')) {
+              final maker = lensElem.findElements('maker').firstOrNull?.innerText.trim() ?? '';
+              final modelElems = lensElem.findElements('model').toList();
+              if (maker.isEmpty || modelElems.isEmpty) continue;
+
+              final model = modelElems.first.innerText.trim();
+              final aliases = modelElems.skip(1).map((e) => e.innerText.trim()).toList();
+              final mount = lensElem.findElements('mount').firstOrNull?.innerText.trim() ?? 'Generic';
+              if (model.isEmpty) continue;
+
+              final calib = lensElem.findElements('calibration').firstOrNull;
+              if (calib == null) continue;
+
+              var distM = 'poly3';
+              var distA = 0.0, distB = 0.0, distC = 0.0, distK1 = 0.0;
+              final distElem = calib.findElements('distortion').firstOrNull;
+              if (distElem != null) {
+                distM = distElem.getAttribute('model') ?? 'poly3';
+                distA = double.tryParse(distElem.getAttribute('a') ?? '') ?? 0.0;
+                distB = double.tryParse(distElem.getAttribute('b') ?? '') ?? 0.0;
+                distC = double.tryParse(distElem.getAttribute('c') ?? '') ?? 0.0;
+                distK1 = double.tryParse(distElem.getAttribute('k1') ?? '') ?? 0.0;
+              }
+
+              var vigK1 = 0.0, vigK2 = 0.0, vigK3 = 0.0;
+              final vigElem = calib.findElements('vignetting').firstOrNull;
+              if (vigElem != null) {
+                vigK1 = double.tryParse(vigElem.getAttribute('k1') ?? '') ?? 0.0;
+                vigK2 = double.tryParse(vigElem.getAttribute('k2') ?? '') ?? 0.0;
+                vigK3 = double.tryParse(vigElem.getAttribute('k3') ?? '') ?? 0.0;
+              }
+
+              var tcaVr = 1.0, tcaBr = 0.0, tcaVb = 1.0, tcaBb = 0.0;
+              final tcaElem = calib.findElements('tca').firstOrNull;
+              if (tcaElem != null) {
+                tcaVr = double.tryParse(tcaElem.getAttribute('vr') ?? '') ?? 1.0;
+                tcaBr = double.tryParse(tcaElem.getAttribute('br') ?? '') ?? 0.0;
+                tcaVb = double.tryParse(tcaElem.getAttribute('vb') ?? '') ?? 1.0;
+                tcaBb = double.tryParse(tcaElem.getAttribute('bb') ?? '') ?? 0.0;
+              }
+
+              // 기존 동일 모델 중복 방지
+              final exists = _profiles.any((p) => p.maker.toLowerCase() == maker.toLowerCase() && p.model.toLowerCase() == model.toLowerCase());
+              if (!exists) {
+                _profiles.add(LensProfile(
+                  maker: maker,
+                  model: model,
+                  mount: mount,
+                  distModel: distM,
+                  distA: distA,
+                  distB: distB,
+                  distC: distC,
+                  distK1: distK1,
+                  vigK1: vigK1,
+                  vigK2: vigK2,
+                  vigK3: vigK3,
+                  tcaVr: tcaVr,
+                  tcaBr: tcaBr,
+                  tcaVb: tcaVb,
+                  tcaBb: tcaBb,
+                  aliases: aliases,
+                ));
+              }
+            }
+          } catch (_) {}
         }
-      }
-      if (dbDir == null) return;
-
-      final xmlFiles = dbDir.listSync().whereType<File>().where((f) => f.path.endsWith('.xml'));
-      for (final f in xmlFiles) {
-        try {
-          final content = f.readAsStringSync();
-          final doc = XmlDocument.parse(content);
-          for (final lensElem in doc.findAllElements('lens')) {
-            final maker = lensElem.findElements('maker').firstOrNull?.innerText.trim() ?? '';
-            final model = lensElem.findElements('model').firstOrNull?.innerText.trim() ?? '';
-            final mount = lensElem.findElements('mount').firstOrNull?.innerText.trim() ?? 'Generic';
-            if (maker.isEmpty || model.isEmpty) continue;
-
-            final calib = lensElem.findElements('calibration').firstOrNull;
-            if (calib == null) continue;
-
-            var distM = 'poly3';
-            var distA = 0.0, distB = 0.0, distC = 0.0, distK1 = 0.0;
-            final distElem = calib.findElements('distortion').firstOrNull;
-            if (distElem != null) {
-              distM = distElem.getAttribute('model') ?? 'poly3';
-              distA = double.tryParse(distElem.getAttribute('a') ?? '') ?? 0.0;
-              distB = double.tryParse(distElem.getAttribute('b') ?? '') ?? 0.0;
-              distC = double.tryParse(distElem.getAttribute('c') ?? '') ?? 0.0;
-              distK1 = double.tryParse(distElem.getAttribute('k1') ?? '') ?? 0.0;
-            }
-
-            var vigK1 = 0.0, vigK2 = 0.0, vigK3 = 0.0;
-            final vigElem = calib.findElements('vignetting').firstOrNull;
-            if (vigElem != null) {
-              vigK1 = double.tryParse(vigElem.getAttribute('k1') ?? '') ?? 0.0;
-              vigK2 = double.tryParse(vigElem.getAttribute('k2') ?? '') ?? 0.0;
-              vigK3 = double.tryParse(vigElem.getAttribute('k3') ?? '') ?? 0.0;
-            }
-
-            var tcaVr = 1.0, tcaBr = 0.0, tcaVb = 1.0, tcaBb = 0.0;
-            final tcaElem = calib.findElements('tca').firstOrNull;
-            if (tcaElem != null) {
-              tcaVr = double.tryParse(tcaElem.getAttribute('vr') ?? '') ?? 1.0;
-              tcaBr = double.tryParse(tcaElem.getAttribute('br') ?? '') ?? 0.0;
-              tcaVb = double.tryParse(tcaElem.getAttribute('vb') ?? '') ?? 1.0;
-              tcaBb = double.tryParse(tcaElem.getAttribute('bb') ?? '') ?? 0.0;
-            }
-
-            // 기존 동일 모델 중복 방지
-            if (!_profiles.any((p) => p.maker == maker && p.model == model)) {
-              _profiles.add(LensProfile(
-                maker: maker,
-                model: model,
-                mount: mount,
-                distModel: distM,
-                distA: distA,
-                distB: distB,
-                distC: distC,
-                distK1: distK1,
-                vigK1: vigK1,
-                vigK2: vigK2,
-                vigK3: vigK3,
-                tcaVr: tcaVr,
-                tcaBr: tcaBr,
-                tcaVb: tcaVb,
-                tcaBb: tcaBb,
-              ));
-            }
-          }
-        } catch (_) {}
       }
     } catch (_) {}
   }

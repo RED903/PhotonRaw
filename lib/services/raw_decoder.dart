@@ -7,6 +7,7 @@ import 'package:ffi/ffi.dart';
 import 'package:image/image.dart' as img;
 
 import 'pipeline_core.dart';
+import 'xmp_service.dart';
 
 /// 디코딩 완료된 풀 해상도 이미지 (14/16-bit RAW의 경우 [linearRgb]에 무손실 32-bit 선형 Float 보유)
 class DecodedImage {
@@ -25,6 +26,8 @@ class DecodedImage {
   final String note;
   final double asShotTemp;
   final double asShotTint;
+  final int rating; // XMP 사이드카 또는 메타데이터 별점 (0 ~ 5)
+  final String xmpPath;
   final Uint8List rgb; // 빠른 히스토그램/자동노출 참조 및 8-bit 이미지용
   final Float32List? linearRgb; // 14/16-bit RAW 및 16-bit 이미지용 무손실 32-bit Float 선형 RGB
 
@@ -44,6 +47,8 @@ class DecodedImage {
     required this.note,
     this.asShotTemp = 6500.0,
     this.asShotTint = 0.0,
+    this.rating = 0,
+    this.xmpPath = '',
     required this.rgb,
     this.linearRgb,
   });
@@ -100,70 +105,105 @@ DecodedImage decodeImageFile(String path) {
   final ext = _extOf(path);
   final name = _nameOf(path);
 
+  DecodedImage decodedImg;
   if (kRawExtensions.contains(ext)) {
-    return _decodeTrueRaw16Bit(file, name, path, ext);
-  }
-
-  final bytes = file.readAsBytesSync();
-  final decoded = img.decodeImage(bytes);
-  if (decoded == null) {
-    throw Exception('지원되지 않거나 손상된 이미지입니다: $name');
-  }
-  img.Image image = decoded;
-  var camera = '';
-  var lensModel = '';
-  double focalLength = 0.0;
-  double aperture = 0.0;
-  try {
-    final make = image.exif.imageIfd.make ?? '';
-    final model = image.exif.imageIfd.model ?? '';
-    camera = '$make $model'.trim();
-    final exif = image.exif;
-    lensModel = exif.getTag(0xA434)?.toString() ?? '';
-    final tagFocal = exif.getTag(0x920A);
-    if (tagFocal != null) focalLength = double.tryParse(tagFocal.toString()) ?? 0.0;
-    final tagFNum = exif.getTag(0x829D);
-    if (tagFNum != null) aperture = double.tryParse(tagFNum.toString()) ?? 0.0;
-  } catch (_) {}
-  try {
-    image = img.bakeOrientation(image);
-  } catch (_) {}
-
-  // 16-bit TIFF / PNG 인 경우 무손실 Float32List 생성
-  final is16BitImg = image.format == img.Format.uint16;
-  Float32List? linearF32;
-  if (is16BitImg) {
-    final c16 = image.numChannels == 3
-        ? image
-        : image.convert(format: img.Format.uint16, numChannels: 3);
-    final u16 = Uint16List.view(
-      c16.getBytes(order: img.ChannelOrder.rgb).buffer,
-    );
-    linearF32 = Float32List(u16.length);
-    for (int i = 0; i < u16.length; i++) {
-      final s = u16[i] / 65535.0;
-      linearF32[i] = s <= 0.04045
-          ? s / 12.92
-          : math.pow((s + 0.055) / 1.055, 2.4).toDouble();
+    decodedImg = _decodeTrueRaw16Bit(file, name, path, ext);
+  } else {
+    final bytes = file.readAsBytesSync();
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) {
+      throw Exception('지원되지 않거나 손상된 이미지입니다: $name');
     }
+    img.Image image = decoded;
+    var camera = '';
+    var lensModel = '';
+    double focalLength = 0.0;
+    double aperture = 0.0;
+    try {
+      final make = image.exif.imageIfd.make ?? '';
+      final model = image.exif.imageIfd.model ?? '';
+      camera = '$make $model'.trim();
+      final exif = image.exif;
+      lensModel = exif.getTag(0xA434)?.toString() ?? '';
+      final tagFocal = exif.getTag(0x920A);
+      if (tagFocal != null) focalLength = double.tryParse(tagFocal.toString()) ?? 0.0;
+      final tagFNum = exif.getTag(0x829D);
+      if (tagFNum != null) aperture = double.tryParse(tagFNum.toString()) ?? 0.0;
+    } catch (_) {}
+    try {
+      image = img.bakeOrientation(image);
+    } catch (_) {}
+
+    final is16BitImg = image.format == img.Format.uint16;
+    Float32List? linearF32;
+    if (is16BitImg) {
+      final c16 = image.numChannels == 3
+          ? image
+          : image.convert(format: img.Format.uint16, numChannels: 3);
+      final u16 = Uint16List.view(
+        c16.getBytes(order: img.ChannelOrder.rgb).buffer,
+      );
+      linearF32 = Float32List(u16.length);
+      for (int i = 0; i < u16.length; i++) {
+        final s = u16[i] / 65535.0;
+        linearF32[i] = s <= 0.04045
+            ? s / 12.92
+            : math.pow((s + 0.055) / 1.055, 2.4).toDouble();
+      }
+    }
+
+    decodedImg = DecodedImage(
+      name: name,
+      path: path,
+      ext: ext.toUpperCase(),
+      fileSize: bytes.length,
+      width: image.width,
+      height: image.height,
+      isRaw: false,
+      bitDepth: is16BitImg ? 16 : 8,
+      camera: camera.isEmpty ? '일반 이미지' : camera,
+      lensModel: lensModel,
+      focalLength: focalLength,
+      aperture: aperture,
+      note: is16BitImg ? '16-bit 무손실 이미지' : '8-bit 표준 이미지',
+      rgb: _toRgbBytes(image),
+      linearRgb: linearF32,
+    );
   }
+
+  // ── 다크테이블/라이트룸 XMP 사이드카 메타데이터 자동 결합 ──
+  final xmp = XmpService.loadXmpSync(path);
+  final finalLens = (xmp.lensModel.isNotEmpty) ? xmp.lensModel : decodedImg.lensModel;
+  final finalCamera = (xmp.cameraModel.isNotEmpty && decodedImg.camera.isEmpty)
+      ? '${xmp.cameraMake} ${xmp.cameraModel}'.trim()
+      : decodedImg.camera;
+  final finalFocal = (xmp.focalLength != null && decodedImg.focalLength == 0.0)
+      ? xmp.focalLength!
+      : decodedImg.focalLength;
+  final finalAperture = (xmp.fNumber != null && decodedImg.aperture == 0.0)
+      ? xmp.fNumber!
+      : decodedImg.aperture;
 
   return DecodedImage(
-    name: name,
-    path: path,
-    ext: ext.toUpperCase(),
-    fileSize: bytes.length,
-    width: image.width,
-    height: image.height,
-    isRaw: false,
-    bitDepth: is16BitImg ? 16 : 8,
-    camera: camera.isEmpty ? '일반 이미지' : camera,
-    lensModel: lensModel,
-    focalLength: focalLength,
-    aperture: aperture,
-    note: is16BitImg ? '16-bit 무손실 이미지' : '8-bit 표준 이미지',
-    rgb: _toRgbBytes(image),
-    linearRgb: linearF32,
+    name: decodedImg.name,
+    path: decodedImg.path,
+    ext: decodedImg.ext,
+    fileSize: decodedImg.fileSize,
+    width: decodedImg.width,
+    height: decodedImg.height,
+    isRaw: decodedImg.isRaw,
+    bitDepth: decodedImg.bitDepth,
+    camera: finalCamera,
+    lensModel: finalLens,
+    focalLength: finalFocal,
+    aperture: finalAperture,
+    note: decodedImg.note,
+    asShotTemp: decodedImg.asShotTemp,
+    asShotTint: decodedImg.asShotTint,
+    rating: xmp.rating,
+    xmpPath: xmp.xmpPath,
+    rgb: decodedImg.rgb,
+    linearRgb: decodedImg.linearRgb,
   );
 }
 
